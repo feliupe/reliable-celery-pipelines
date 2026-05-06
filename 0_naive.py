@@ -1,0 +1,91 @@
+"""Naive baseline demonstrating FM-1: pipeline dies mid-way on partial failure.
+
+
+Run instructions
+----------------
+  # 1. start the broker
+  docker-compose up -d
+
+  # 2. start a worker (in one terminal)
+  celery -A 0_naive worker --loglevel=info
+
+  # 3. run the script (in another terminal)
+  python 0_naive.py                 # failure case: FM-1 is demonstrated
+  FAIL_PARSE=0 python 0_naive.py    # happy path: proves the wiring works
+
+"""
+
+import os
+import time
+
+from celery import Celery, chord
+from celery.exceptions import ChordError
+
+app = Celery(
+    "naive",
+    broker="amqp://guest:guest@localhost:5672//",
+    backend="redis://localhost:6379/0",
+)
+
+
+# Explicit task names so the client (running as __main__) and the worker
+# (running with `-A 0_naive`) agree on the task registry keys. Without
+# this, the client sends `naive.fetch_document` and the worker looks up
+# `0_naive.fetch_document`, and every message is silently discarded.
+@app.task(name="fetch_document")
+def fetch_document(doc_id):
+    return {"doc_id": doc_id, "bytes": len(doc_id) * 100}
+
+
+# parse_document raises unconditionally when FAIL_PARSE=1 (the default).
+# Deterministic failure — not random — so the demo is reproducible. The
+# raised exception propagates: no try/except, no retry, no errback. That
+# is the whole point of FM-1.
+@app.task(name="parse_document")
+def parse_document(fetched):
+    doc_id = fetched["doc_id"]
+
+    raise RuntimeError(f"parser crashed on {doc_id}")
+    return {"doc_id": doc_id, "parsed": True}
+
+
+@app.task(name="notify")
+def notify(results):
+    print(f"notify aggregated: {results}")
+    return {"final": True, "results": results}
+
+
+def run_pipeline():
+    docs = ["doc1", "doc2"]
+    header = [fetch_document.s(d) | parse_document.s() for d in docs]
+    print(
+        "submitting chord: "
+        "header=[fetch|parse(doc1), fetch|parse(doc2)], "
+        "callback=notify"
+    )
+    pipeline = chord(header, body=notify.s())
+    result = pipeline.apply_async()
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        print("Not ready.")
+        if result.ready():
+            print("Ready.")
+            break
+        time.sleep(0.5)
+
+    if not result.ready():
+        print(
+            "FM-1: callback did not fire. pipeline is dead. "
+            "no aggregation, no final state, no visibility."
+        )
+        return
+
+    value = result.get(timeout=1, propagate=False)
+    print(f"pipeline result: {value}")
+
+    assert not isinstance(value, ChordError), "Something failed: 'notify' not called."
+
+
+if __name__ == "__main__":
+    run_pipeline()

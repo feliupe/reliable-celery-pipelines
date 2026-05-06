@@ -1,7 +1,9 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
-
-
-# Environments
-.venv
-
+*.pyc
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.egg-info/
+celery_results.sqlite

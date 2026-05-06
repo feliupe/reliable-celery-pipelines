@@ -1,0 +1,24 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: reliable-celery-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  # Celery result backend for all examples. RabbitMQ is the broker;
+  # Redis holds task results and any cross-process shared state (e.g.
+  # the attempt counters in 2_transient_failure.py).
+  redis:
+    image: redis:7-alpine
+    container_name: reliable-celery-redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  rabbitmq_data:
