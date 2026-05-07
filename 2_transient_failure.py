@@ -37,17 +37,25 @@ import functools
 import random
 import time
 
+import redis
 from celery import Celery, chord
 from celery.exceptions import MaxRetriesExceededError, Retry
+
+REDIS_URL = "redis://localhost:6379/0"
 
 app = Celery(
     "2_transient_failure",
     broker="amqp://guest:guest@localhost:5672//",
-    # Redis backend (not SQLite) so we can use app.backend.client.incr to
-    # share the attempt counter between worker and client. SQLite's result
-    # backend doesn't expose a generic atomic-counter API.
-    backend="redis://localhost:6379/0",
+    # Redis backend (not SQLite) so we have a place to share the attempt
+    # counter between worker and client. SQLite's result backend doesn't
+    # expose a generic atomic-counter API.
+    backend=REDIS_URL,
 )
+
+# Direct Redis client for fixture state. Could go through `redis_client`,
+# but that couples our code to "the result backend happens to be Redis";
+# redis-py directly is honest about the dependency.
+redis_client = redis.Redis.from_url(REDIS_URL)
 
 MAX_RETRIES = 3
 
@@ -155,18 +163,18 @@ def _incr_calls(doc_id: str) -> int:
     (Redis). Worker writes; client reads. Replaces an in-process dict that
     only worked under --concurrency=1 with an arbiter that also survives
     worker restarts and concurrent execution."""
-    return app.backend.client.incr(_count_key(doc_id))
+    return redis_client.incr(_count_key(doc_id))
 
 
 def _read_calls(doc_id: str) -> int:
-    raw = app.backend.client.get(_count_key(doc_id))
+    raw = redis_client.get(_count_key(doc_id))
     return int(raw) if raw else 0
 
 
 def _reset_calls(doc_ids):
     keys = [_count_key(d) for d in doc_ids]
     if keys:
-        app.backend.client.delete(*keys)
+        redis_client.delete(*keys)
 
 
 def _expected_calls(doc_id: str) -> int:
