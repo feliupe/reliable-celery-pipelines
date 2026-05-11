@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "celery[redis]==5.4.0",
+    "celery[redis]==5.5.3",
 ]
 
 # This repo is a set of runnable demo scripts, not an installable library —
