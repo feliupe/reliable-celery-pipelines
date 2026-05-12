@@ -9,9 +9,9 @@ failures.
 Run
 ---
   docker-compose up -d
-  celery -A 1_resilience worker --loglevel=info
-  python 1_resilience.py                  # FAIL_PARSE=1 (default): notify runs, reports failures
-  FAIL_PARSE=0 python 1_resilience.py     # happy path
+  celery -A fm1_mid_pipeline_error worker --loglevel=info
+  python fm1_mid_pipeline_error.py                  # FAIL_PARSE=1 (default): notify runs, reports failures
+  FAIL_PARSE=0 python fm1_mid_pipeline_error.py     # happy path
 """
 
 import os
