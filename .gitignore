@@ -7,3 +7,4 @@ venv/
 .vscode/
 *.egg-info/
 celery_results.sqlite
+celerybeat-schedule
