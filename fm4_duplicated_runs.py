@@ -69,6 +69,8 @@ from celery.app.task import Context
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.wait import wait_until
+
 REDIS_URL = "redis://localhost:6379/0"
 
 app = Celery(
@@ -429,11 +431,10 @@ def run_pipeline() -> None:
     # doc2 finishes fast, doc1 needs DELIVERY_LIMIT crashes + a
     # drain_dlq tick to be finalized. Budget 60s.
     print("waiting for chord notify to claim the lock...")
-    deadline = time.time() + 60
-    while time.time() < deadline and not redis_client.exists(state_key):
-        time.sleep(0.5)
-    assert redis_client.exists(state_key), (
-        "chord notify never claimed the lock within 60s"
+    wait_until(
+        lambda: bool(redis_client.exists(state_key)),
+        timeout=60,
+        message="chord notify never claimed the lock within 60s",
     )
 
     # Duplicate fire with the same pipeline_id. The chord's notify
@@ -445,13 +446,10 @@ def run_pipeline() -> None:
 
     # Worst case: SEND_EMAIL_DURATION + NOTIFY_RETRY_DELAY + slack.
     print("waiting for both notifies to complete...")
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if chord_result.ready() and duplicate_result.ready():
-            break
-        time.sleep(0.5)
-    assert chord_result.ready() and duplicate_result.ready(), (
-        "tasks did not finish within 30s"
+    wait_until(
+        lambda: chord_result.ready() and duplicate_result.ready(),
+        timeout=30,
+        message="tasks did not finish within 30s",
     )
 
     first = chord_result.get(timeout=1)

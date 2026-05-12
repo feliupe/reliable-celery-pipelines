@@ -58,10 +58,11 @@ from __future__ import annotations
 
 import os
 import signal
-import time
 
 import redis
 from celery import Celery, chord
+
+from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
 
@@ -140,16 +141,14 @@ def run_pipeline() -> None:
 
     # Worst case: crash detection (~few s) + respawn or sibling
     # pickup + parse. 30s is comfortable.
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if result.ready():
-            break
-        time.sleep(0.5)
-
-    assert result.ready(), (
-        "chord body did not fire within 30s — FM-2 not fixed. "
-        "Without acks_late + reject_on_worker_lost the SIGKILL'd "
-        "message is lost and the chord stalls forever."
+    wait_until(
+        result.ready,
+        timeout=30,
+        message=(
+            "chord body did not fire within 30s — FM-2 not fixed. "
+            "Without acks_late + reject_on_worker_lost the SIGKILL'd "
+            "message is lost and the chord stalls forever."
+        ),
     )
 
     value = result.get(timeout=1)

@@ -76,6 +76,8 @@ from celery.exceptions import MaxRetriesExceededError, Retry
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.wait import wait_until
+
 REDIS_URL = "redis://localhost:6379/0"
 
 app = Celery(
@@ -561,24 +563,20 @@ def run_pipeline() -> None:
     # exhaustion ≈ 1+2+4 backoff = ~7-10s, retryable recovery ≈ 3-5s).
     # All in parallel for headers, so ≈ 20s. 90s is comfortable.
     print("waiting for chord notify to claim the lock...")
-    deadline = time.time() + 90
-    while time.time() < deadline and not redis_client.exists(state_key):
-        time.sleep(0.5)
-    assert redis_client.exists(state_key), (
-        "chord notify never claimed the lock within 90s"
+    wait_until(
+        lambda: bool(redis_client.exists(state_key)),
+        timeout=90,
+        message="chord notify never claimed the lock within 90s",
     )
 
     print("--- triggering concurrent duplicate notify ---")
     duplicate_result = notify.delay([], pipeline_id=pipeline_id)
 
     print("waiting for both notifies to complete...")
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if chord_result.ready() and duplicate_result.ready():
-            break
-        time.sleep(0.5)
-    assert chord_result.ready() and duplicate_result.ready(), (
-        "tasks did not finish within 30s"
+    wait_until(
+        lambda: chord_result.ready() and duplicate_result.ready(),
+        timeout=30,
+        message="tasks did not finish within 30s",
     )
 
     first = chord_result.get(timeout=1)

@@ -92,7 +92,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import time
 import uuid
 
 import redis
@@ -100,6 +99,8 @@ from celery import Celery, chord
 from celery.app.task import Context
 from celery.schedules import schedule
 from kombu import Exchange, Queue
+
+from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
 
@@ -423,12 +424,12 @@ def run_pipeline() -> None:
     # Budget: DELIVERY_LIMIT crashes (~5-15s) + drain interval (≤5s)
     # + body run (~1s) << 90s.
     print("waiting for chord body...")
-    deadline = time.time() + 90
-    while time.time() < deadline:
-        if chord_result.ready():
-            break
-        time.sleep(1)
-    assert chord_result.ready(), "chord body did not fire within 90s"
+    wait_until(
+        chord_result.ready,
+        timeout=90,
+        interval=1,
+        message="chord body did not fire within 90s",
+    )
 
     value = chord_result.get(timeout=1)
     print(f"pipeline result: {value}")

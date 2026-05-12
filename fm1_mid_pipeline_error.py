@@ -17,9 +17,10 @@ Run
 from __future__ import annotations
 
 import os
-import time
 
 from celery import Celery, chord
+
+from shared.wait import wait_until
 
 app = Celery(
     "fm1_mid_pipeline_error",
@@ -60,13 +61,11 @@ def run_pipeline() -> None:
     pipeline = chord(header, body=notify.s())
     result = pipeline.apply_async()
 
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if result.ready():
-            break
-        time.sleep(0.5)
-
-    assert result.ready(), "chord body did not fire within 10s — FM-1 not fixed"
+    wait_until(
+        result.ready,
+        timeout=10,
+        message="chord body did not fire within 10s — FM-1 not fixed",
+    )
     value = result.get(timeout=1)
     print(f"pipeline result: {value}")
     assert "final" in value, "Notify task did not run."
