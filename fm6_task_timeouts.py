@@ -122,7 +122,6 @@ Run
 from __future__ import annotations
 
 import functools
-import json
 import os
 import random
 import signal
@@ -665,26 +664,6 @@ def _expected_attempts(doc_id: str) -> int:
         return MAX_RETRIES + 1
     assert isinstance(schedule, int)
     return schedule + 1
-
-
-def print_all_task_results() -> None:
-    """Scan the Redis backend for every `celery-task-meta-*` key and
-    print task_id, state, task name, and result/error."""
-    states: dict[str, int] = {}
-    for key in redis_client.scan_iter(match="celery-task-meta-*"):
-        raw = redis_client.get(key)
-        if not raw:
-            continue
-        meta = json.loads(raw)
-        task_id = meta.get("task_id") or key.decode().split("celery-task-meta-")[-1]
-        state = meta.get("status", "UNKNOWN")
-        name = meta.get("name") or "?"
-        result = meta.get("result")
-        states[state] = states.get(state, 0) + 1
-        print(f"  [{state:<8}] {task_id}  task={name}  result={result!r}")
-
-    summary = ", ".join(f"{s}={n}" for s, n in sorted(states.items()))
-    print(f"backend totals: {summary or '(no task results found)'}")
 
 
 def run_pipeline() -> None:

@@ -89,7 +89,6 @@ PRECONDITION_FAILED.
 
 from __future__ import annotations
 
-import json
 import os
 import signal
 import uuid
@@ -100,6 +99,7 @@ from celery.app.task import Context
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.inspect import print_all_task_results
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
@@ -373,27 +373,6 @@ def _reset(doc_ids: list[str]) -> None:
         redis_client.delete(*keys)
 
 
-def print_all_task_results() -> None:
-    """Scan the Redis backend for every `celery-task-meta-*` key and
-    print task_id, state, task name, and result/error. Useful after a
-    run to confirm every header + body landed in SUCCESS."""
-    states: dict[str, int] = {}
-    for key in redis_client.scan_iter(match="celery-task-meta-*"):
-        raw = redis_client.get(key)
-        if not raw:
-            continue
-        meta = json.loads(raw)
-        task_id = meta.get("task_id") or key.decode().split("celery-task-meta-")[-1]
-        state = meta.get("status", "UNKNOWN")
-        name = meta.get("name") or "?"
-        result = meta.get("result")
-        states[state] = states.get(state, 0) + 1
-        print(f"  [{state:<8}] {task_id}  task={name}  result={result!r}")
-
-    summary = ", ".join(f"{s}={n}" for s, n in sorted(states.items()))
-    print(f"backend totals: {summary or '(no task results found)'}")
-
-
 def _read_attempts(doc_id: str) -> int:
     raw = redis_client.get(_attempts_key(doc_id))
     return int(raw) if raw else 0
@@ -463,4 +442,4 @@ def run_pipeline() -> None:
 
 if __name__ == "__main__":
     run_pipeline()
-    print_all_task_results()
+    print_all_task_results(redis_client)
