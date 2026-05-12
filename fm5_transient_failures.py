@@ -239,13 +239,26 @@ def retryable(
 # Per-doc behavior schedule (demo-only)
 # ---------------------------------------------------------------------------
 
-POISON = "poison"  # SIGKILL the worker every call → DLQ path
-FLAKE_FOREVER = -1  # always raise TransientServiceError → exhaust retries
+
+class _Sentinel:
+    """Identity-based marker for FLAKE_SCHEDULE entries. Using a small
+    class (rather than mixing strings and -1) lets every schedule value
+    be either a sentinel or an int count, with no ambiguous overlap."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"<{self.name}>"
 
 
-# doc_id → either POISON, or an integer N meaning "raise transient N
-# times then succeed" (N == FLAKE_FOREVER means never succeed).
-FLAKE_SCHEDULE = {
+POISON = _Sentinel("POISON")  # SIGKILL the worker every call → DLQ path
+FLAKE_FOREVER = _Sentinel("FLAKE_FOREVER")  # always raise TransientServiceError → exhaust retries
+
+
+# doc_id → either POISON, FLAKE_FOREVER, or an integer N meaning
+# "raise transient N times then succeed".
+FLAKE_SCHEDULE: dict[str, _Sentinel | int] = {
     "doc1": POISON,
     "doc2": 2,
     "doc3": FLAKE_FOREVER,
@@ -318,14 +331,14 @@ def parse_document(self, fetched: dict) -> dict:
     attempts = redis_client.incr(_attempts_key(doc_id))
     schedule = FLAKE_SCHEDULE.get(doc_id, 0)
 
-    if schedule == POISON:
+    if schedule is POISON:
         print(
             f"  worker pid={os.getpid()}: poison crash on {doc_id} "
             f"(attempt {attempts}/{DELIVERY_LIMIT})"
         )
         os.kill(os.getpid(), signal.SIGKILL)
 
-    if schedule == FLAKE_FOREVER or (
+    if schedule is FLAKE_FOREVER or (
         isinstance(schedule, int) and attempts <= schedule
     ):
         raise TransientServiceError(f"503 from parser-svc on {doc_id}")
@@ -501,10 +514,11 @@ def _expected_attempts(doc_id: str) -> int:
       N (int ≥ 0)    → N flakes then success = N + 1 calls
     """
     schedule = FLAKE_SCHEDULE.get(doc_id, 0)
-    if schedule == POISON:
+    if schedule is POISON:
         return DELIVERY_LIMIT
-    if schedule == FLAKE_FOREVER:
+    if schedule is FLAKE_FOREVER:
         return MAX_RETRIES + 1
+    assert isinstance(schedule, int)
     return schedule + 1
 
 
@@ -602,7 +616,7 @@ def run_pipeline() -> None:
         # ±1 tolerance on the poison count — exact x-delivery-count
         # inclusive/exclusive semantics vary slightly between RabbitMQ
         # versions.
-        if FLAKE_SCHEDULE[d] == POISON:
+        if FLAKE_SCHEDULE[d] is POISON:
             assert expected <= actual <= expected + 1, (
                 f"{d}: expected ~{expected} crashes; got {actual}"
             )
