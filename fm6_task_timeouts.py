@@ -1,7 +1,7 @@
 """Fix for FM-6: a task that hangs (without crashing) no longer
 consumes a worker slot indefinitely.
 
-Layered on 5_transient_failures.py; the DLQ, idempotent notify,
+Layered on fm5_transient_failures.py; the DLQ, idempotent notify,
 acks_late survivability, and retry decorators are inherited
 verbatim. Read those files first.
 
@@ -115,8 +115,8 @@ Per-doc scenario
 Run
 ---
   docker-compose up -d
-  celery -A 6_task_timeouts worker --loglevel=info --concurrency=2 --beat
-  python 6_task_timeouts.py
+  celery -A fm6_task_timeouts worker --loglevel=info --concurrency=2 --beat
+  python fm6_task_timeouts.py
 """
 
 import functools
@@ -136,14 +136,14 @@ from kombu import Exchange, Queue
 REDIS_URL = "redis://localhost:6379/0"
 
 app = Celery(
-    "6_task_timeouts",
+    "fm6_task_timeouts",
     broker="amqp://guest:guest@localhost:5672//",
     backend=REDIS_URL,
 )
 
 
 # ---------------------------------------------------------------------------
-# Broker topology — see 3_dlq_reconciliation.py. Renamed fm5.* → fm6.*
+# Broker topology — see fm3_dlq_reconciliation.py. Renamed fm5.* → fm6.*
 # so this file's queues coexist with prior FMs.
 # ---------------------------------------------------------------------------
 
@@ -477,7 +477,7 @@ def parse_document(self, fetched):
     time_limit=NOTIFY_HARD_TIMEOUT_SECONDS,
 )
 def notify(self, results, pipeline_id):
-    """See 4_duplicated_runs.py for the idempotency contract. Not
+    """See fm4_duplicated_runs.py for the idempotency contract. Not
     decorated — the chord-body return shape is {sent: True/False}
     and @always_returns_envelope would clobber that on any failure."""
     state_key = _notify_state_key(pipeline_id)

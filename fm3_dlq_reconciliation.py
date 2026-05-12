@@ -44,7 +44,7 @@ when collecting the final results. That sends the failure to the
 body's link_error rather than firing the body. The chord effectively
 never completes from the body's perspective.
 
-The fix mirrors what 1_mid_pipeline_error.py does inside the task
+The fix mirrors what fm1_mid_pipeline_error.py does inside the task
 body: never write FAILURE; always write SUCCESS with an envelope
 payload `{ok: False, error: ...}` that ENCODES the failure. The
 chord coordinator sees clean SUCCESS states across all members and
@@ -74,8 +74,8 @@ Without FM-6, this file cannot recover from hangs.
 Run
 ---
   docker-compose up -d
-  celery -A 3_dlq_reconciliation worker --loglevel=info --concurrency=2 --beat
-  python 3_dlq_reconciliation.py
+  celery -A fm3_dlq_reconciliation worker --loglevel=info --concurrency=2 --beat
+  python fm3_dlq_reconciliation.py
 
 `--beat` runs the scheduler in-worker, fine for the demo. In
 production beat is a separate process so the worker fleet can scale
@@ -101,7 +101,7 @@ from kombu import Exchange, Queue
 REDIS_URL = "redis://localhost:6379/0"
 
 app = Celery(
-    "3_dlq_reconciliation",
+    "fm3_dlq_reconciliation",
     broker="amqp://guest:guest@localhost:5672//",
     backend=REDIS_URL,
 )

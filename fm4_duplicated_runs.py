@@ -1,7 +1,7 @@
 """Fix for FM-4: notify is idempotent — duplicate executions don't
 double-send.
 
-Layered on top of 3_dlq_reconciliation.py (FM-3); the broker
+Layered on top of fm3_dlq_reconciliation.py (FM-3); the broker
 topology, drain_dlq beat task, and acks_late survivability are
 inherited verbatim. Read that file first.
 
@@ -38,7 +38,7 @@ pipeline.
 
 Chord-body signature: .s() not .si()
 ------------------------------------
-3_dlq_reconciliation.py uses notify.si(pipeline_id) to ignore the
+fm3_dlq_reconciliation.py uses notify.si(pipeline_id) to ignore the
 header results list. Here we switch to notify.s(pipeline_id=...) so
 header results flow in as `results` — letting notify aggregate
 ok/failed across both doc2's normal envelope and doc1's
@@ -47,8 +47,8 @@ DLQ-finalized envelope (both shapes carry an `ok` field).
 Run
 ---
   docker-compose up -d
-  celery -A 4_duplicated_runs worker --loglevel=info --concurrency=2 --beat
-  python 4_duplicated_runs.py
+  celery -A fm4_duplicated_runs worker --loglevel=info --concurrency=2 --beat
+  python fm4_duplicated_runs.py
 
 --concurrency=2 is required for FM-4: with --concurrency=1 the
 duplicate notify is queued behind the chord's notify and never lands
@@ -69,14 +69,14 @@ from kombu import Exchange, Queue
 REDIS_URL = "redis://localhost:6379/0"
 
 app = Celery(
-    "4_duplicated_runs",
+    "fm4_duplicated_runs",
     broker="amqp://guest:guest@localhost:5672//",
     backend=REDIS_URL,
 )
 
 
 # ---------------------------------------------------------------------------
-# Broker topology — see 3_dlq_reconciliation.py for the rationale.
+# Broker topology — see fm3_dlq_reconciliation.py for the rationale.
 # Renamed fm3.* → fm4.* so this file's queues coexist with FM-3's
 # without colliding on declare (RabbitMQ rejects redeclare with
 # different x-args).

@@ -46,8 +46,8 @@ worker loops forever. → FM-3.
 Run
 ---
   docker-compose up -d
-  celery -A 2_worker_crash worker --loglevel=info --concurrency=2
-  python 2_worker_crash.py
+  celery -A fm2_worker_crash worker --loglevel=info --concurrency=2
+  python fm2_worker_crash.py
 
 Concurrency must be >= 2: a sibling worker absorbs the redelivered
 message immediately rather than waiting for the master to respawn the
@@ -64,7 +64,7 @@ from celery import Celery, chord
 REDIS_URL = "redis://localhost:6379/0"
 
 app = Celery(
-    "2_worker_crash",
+    "fm2_worker_crash",
     broker="amqp://guest:guest@localhost:5672//",
     backend=REDIS_URL,
 )

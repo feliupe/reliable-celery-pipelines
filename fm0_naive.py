@@ -7,11 +7,11 @@ Run instructions
   docker-compose up -d
 
   # 2. start a worker (in one terminal)
-  celery -A 0_naive worker --loglevel=info
+  celery -A fm0_naive worker --loglevel=info
 
   # 3. run the script (in another terminal)
-  python 0_naive.py                 # failure case: FM-1 is demonstrated
-  FAIL_PARSE=0 python 0_naive.py    # happy path: proves the wiring works
+  python fm0_naive.py                 # failure case: FM-1 is demonstrated
+  FAIL_PARSE=0 python fm0_naive.py    # happy path: proves the wiring works
 
 """
 
@@ -22,16 +22,17 @@ from celery import Celery, chord
 from celery.exceptions import ChordError
 
 app = Celery(
-    "naive",
+    "fm0_naive",
     broker="amqp://guest:guest@localhost:5672//",
     backend="redis://localhost:6379/0",
 )
 
 
 # Explicit task names so the client (running as __main__) and the worker
-# (running with `-A 0_naive`) agree on the task registry keys. Without
-# this, the client sends `naive.fetch_document` and the worker looks up
-# `0_naive.fetch_document`, and every message is silently discarded.
+# (running with `-A fm0_naive`) agree on the task registry keys. Without
+# `name=`, Celery auto-derives task names from the app's main module —
+# which can be `__main__` for the client vs the module name for the
+# worker. Explicit names sidestep the mismatch entirely.
 @app.task(name="fetch_document")
 def fetch_document(doc_id):
     return {"doc_id": doc_id, "bytes": len(doc_id) * 100}

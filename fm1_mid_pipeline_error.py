@@ -20,7 +20,7 @@ import time
 from celery import Celery, chord
 
 app = Celery(
-    "1_mid_pipeline_error",
+    "fm1_mid_pipeline_error",
     broker="amqp://guest:guest@localhost:5672//",
     backend="redis://localhost:6379/0",
 )

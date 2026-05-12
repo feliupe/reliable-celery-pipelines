@@ -1,7 +1,7 @@
 """Fix for FM-5: intermittent failures from external services no
 longer kill the doc.
 
-Layered on 4_duplicated_runs.py (FM-4); the DLQ reconciliation,
+Layered on fm4_duplicated_runs.py (FM-4); the DLQ reconciliation,
 idempotent notify, and acks_late survivability are inherited
 verbatim. Read those files first.
 
@@ -53,8 +53,8 @@ Per-doc scenario (deterministic for reproducible asserts)
 Run
 ---
   docker-compose up -d
-  celery -A 5_transient_failures worker --loglevel=info --concurrency=2 --beat
-  python 5_transient_failures.py
+  celery -A fm5_transient_failures worker --loglevel=info --concurrency=2 --beat
+  python fm5_transient_failures.py
 """
 
 import functools
@@ -74,14 +74,14 @@ from kombu import Exchange, Queue
 REDIS_URL = "redis://localhost:6379/0"
 
 app = Celery(
-    "5_transient_failures",
+    "fm5_transient_failures",
     broker="amqp://guest:guest@localhost:5672//",
     backend=REDIS_URL,
 )
 
 
 # ---------------------------------------------------------------------------
-# Broker topology — see 3_dlq_reconciliation.py. Renamed fm4.* → fm5.*
+# Broker topology — see fm3_dlq_reconciliation.py. Renamed fm4.* → fm5.*
 # so this file's queues coexist with prior FMs without redeclare
 # collisions.
 # ---------------------------------------------------------------------------
