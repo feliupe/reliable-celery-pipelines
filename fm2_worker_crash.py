@@ -58,14 +58,19 @@ from __future__ import annotations
 
 import os
 import signal
+import uuid
 
 import redis
 from celery import Celery, chord
 
+from shared.counters import incr_attempts, read_attempts, reset_attempts
+from shared.decorators import enveloped
 from shared.fm_asserts import assert_fm1_chord_body_fired, assert_fm2_redelivery_happened
+from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
+ATTEMPTS_KEY_PREFIX = "fm2:crash_attempts"
 
 app = Celery(
     "fm2_worker_crash",
@@ -79,24 +84,23 @@ app = Celery(
 redis_client = redis.Redis.from_url(REDIS_URL)
 
 
-def _attempts_key(doc_id: str) -> str:
-    return f"crash_attempts:{doc_id}"
-
-
 # Pipeline-wide settings. acks_late + reject_on_worker_lost is applied
 # uniformly to every task in the chain — in production you don't want
 # any step to silently swallow a crashed message. The demo only
 # exercises the flags on parse_document (it's the one that crashes),
 # but the uniform application matches realistic config.
-@app.task(name="fetch_document", acks_late=True, reject_on_worker_lost=True)
-def fetch_document(doc_id: str) -> dict:
-    return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
+@app.task(name="fetch_document", bind=True, acks_late=True, reject_on_worker_lost=True)
+@enveloped
+def fetch_document(self, doc_id: str) -> FetchPayload:
+    return FetchPayload(doc_id=doc_id, bytes=len(doc_id) * 100)
 
 
-@app.task(name="parse_document", acks_late=True, reject_on_worker_lost=True)
-def parse_document(fetched: dict) -> dict:
-    doc_id = fetched["doc_id"]
-    attempts = redis_client.incr(_attempts_key(doc_id))
+@app.task(name="parse_document", bind=True, acks_late=True, reject_on_worker_lost=True)
+@enveloped
+def parse_document(self, fetched: dict) -> ParsePayload:
+    fetch_result = Result.from_dict(fetched, FetchPayload)
+    doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
+    attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
 
     # Crash injection: doc1's first execution dies hard mid-task.
     # SIGKILL is uncatchable — bypasses Python cleanup and Celery
@@ -106,38 +110,40 @@ def parse_document(fetched: dict) -> dict:
         os.kill(os.getpid(), signal.SIGKILL)
 
     print(f"  worker pid={os.getpid()}: parsed {doc_id} (attempt {attempts})")
-    return {"doc_id": doc_id, "ok": True, "parsed": True, "attempts": attempts}
+    return ParsePayload(doc_id=doc_id, parsed=True, attempts=attempts)
 
 
-@app.task(name="notify", acks_late=True, reject_on_worker_lost=True)
-def notify(results: list[dict]) -> dict:
-    ok = [r for r in results if r.get("ok")]
-    failed = [r for r in results if not r.get("ok")]
+@app.task(name="notify", bind=True, acks_late=True, reject_on_worker_lost=True)
+@enveloped
+def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
+    typed: list[Result[ParsePayload]] = [
+        Result.from_dict(r, ParsePayload) for r in results
+    ]
+    ok = [r for r in typed if r.status == "SUCCESS"]
+    failed = [r for r in typed if r.status == "FAILURE"]
     print(f"notify: {len(ok)} ok, {len(failed)} failed")
     for r in ok:
-        print(f"  ok:     {r['doc_id']} (attempts={r.get('attempts')})")
+        doc_id = r.payload.doc_id if r.payload else "?"
+        attempts = r.payload.attempts if r.payload else "?"
+        print(f"  ok:     {doc_id} (attempts={attempts})")
     for r in failed:
-        print(f"  failed: {r['doc_id']}: {r.get('error')}")
-    return {"final": True, "ok": len(ok), "failed": len(failed), "results": results}
-
-
-def _reset(doc_ids: list[str]) -> None:
-    keys = [_attempts_key(d) for d in doc_ids]
-    if keys:
-        redis_client.delete(*keys)
-
-
-def _read_attempts(doc_id: str) -> int:
-    raw = redis_client.get(_attempts_key(doc_id))
-    return int(raw) if raw else 0
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  failed: {doc_id}: {r.error}")
+    return NotifyPayload(
+        final=True,
+        pipeline_id=pipeline_id,
+        ok=len(ok),
+        failed=len(failed),
+    )
 
 
 def run_pipeline() -> None:
     docs = ["doc1", "doc2"]
-    _reset(docs)
+    pipeline_id = str(uuid.uuid4())
+    reset_attempts(redis_client, docs, ATTEMPTS_KEY_PREFIX)
 
     header = [fetch_document.s(d) | parse_document.s() for d in docs]
-    pipeline = chord(header, body=notify.s())
+    pipeline = chord(header, body=notify.s(pipeline_id=pipeline_id))
     result = pipeline.apply_async()
 
     # Worst case: crash detection (~few s) + respawn or sibling
@@ -152,17 +158,21 @@ def run_pipeline() -> None:
         ),
     )
 
-    value = result.get(timeout=1)
-    print(f"pipeline result: {value}")
+    raw = result.get(timeout=1)
+    print(f"pipeline result: {raw}")
+    notify_result = Result.from_dict(raw, NotifyPayload)
 
-    doc1_attempts = _read_attempts("doc1")
-    doc2_attempts = _read_attempts("doc2")
+    doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
+    doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
     print("parse attempts (from Redis):")
     print(f"  doc1: {doc1_attempts} (expected 2 — crash + redelivery)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
 
-    assert_fm1_chord_body_fired(value)
+    assert_fm1_chord_body_fired(notify_result)
     assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
+    assert doc1_attempts == 2, (
+        f"FM-2: doc1 should have run exactly twice; got {doc1_attempts}"
+    )
     print("FM-2 fixed: SIGKILL'd parse_document was redelivered and completed.")
 
 
