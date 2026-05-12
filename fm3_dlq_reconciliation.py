@@ -95,7 +95,6 @@ import uuid
 
 import redis
 from celery import Celery, chord
-from celery.app.task import Context
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
@@ -254,104 +253,9 @@ def notify(pipeline_id: str) -> dict:
 
 @app.task(name="drain_dlq")
 def drain_dlq() -> None:
-    """Beat task. Pulls all messages currently in fm3.dead_letters
-    and writes a SUCCESS-state envelope to the result backend for
-    each, with the original chord context attached. That triggers
-    Celery's native on_chord_part_return and lets the chord body
-    fire through its normal coordinator path.
-
-    Idempotency: mark_as_done overwrites the task_id's result key,
-    so re-processing the same DLQ message after a drain crash is
-    safe at the backend level. The Redis chord coordinator cleans
-    up its group keys after body dispatch, so a re-INCR from a
-    repeat call no-ops. FM-4 (idempotency on notify) remains the
-    canonical defense against event-level double-fire."""
-    with app.connection_for_write() as conn:
-        with conn.channel() as ch:
-            bound_dlq = dead_letter_queue(ch)
-            while True:
-                msg = bound_dlq.get(no_ack=False)
-                if msg is None:
-                    return
-                _finalize_dlq_message(msg)
-
-
-def _finalize_dlq_message(msg) -> None:
-    """Extract chord context from a DLQ'd task message and finalize
-    it as a successful (envelope-payload) result.
-
-    Celery protocol v2 splits task metadata across two places:
-      - AMQP headers carry id, task, group, group_index, etc.
-      - The message body is a tuple (args, kwargs, embed), where
-        embed holds {callbacks, errbacks, chain, chord}.
-    The chord callback signature is in embed, not headers. RabbitMQ's
-    DLX preserves both the headers and the body verbatim when
-    dead-lettering, so both are available here."""
-    headers = msg.headers or {}
-    task_id = headers.get("id")
-    group_id = headers.get("group")
-    group_index = headers.get("group_index")
-    task_name = headers.get("task")
-
-    try:
-        args, _, embed = msg.payload
-    except (ValueError, TypeError):
-        # Not a Celery v2 task message (older protocol, custom
-        # producer, manual injection). Nothing we can finalize.
-        print(f"drain_dlq: skipping non-v2 DLQ message (task_id={task_id!r})")
-        msg.ack()
-        return
-    chord_sig = (embed or {}).get("chord")
-
-    if not task_id or not chord_sig:
-        # Valid Celery task but not a chord member — no coordinator
-        # to advance. Drop silently.
-        print(f"drain_dlq: skipping non-chord DLQ message (task_id={task_id!r})")
-        msg.ack()
-        return
-
-    # Rebuild a request-shaped context. The required fields for
-    # on_chord_part_return to advance the coordinator are id, group,
-    # group_index, and chord. `task` is informational.
-    context = Context()
-    context.id = task_id
-    context.group = group_id
-    context.group_index = group_index
-    context.chord = app.signature(chord_sig)
-    context.task = task_name
-
-    envelope = {
-        "doc_id": _infer_doc_id_from_args(args),
-        "ok": False,
-        "error": "DLQ'd: x-delivery-limit exceeded",
-        "task_id": task_id,
-    }
-    print(
-        f"drain_dlq: finalizing chord-member {task_id} "
-        f"(group={group_id}, task={task_name}) with envelope"
-    )
-    # mark_as_done writes state=SUCCESS by default. SUCCESS is what
-    # we want — see module docstring for the ChordError-on-FAILURE
-    # trap that mark_as_failure would trigger.
-    app.backend.mark_as_done(task_id, envelope, request=context)
-    msg.ack()
-
-
-def _infer_doc_id_from_args(args) -> str | None:
-    """Best-effort recovery of the input identity for the envelope.
-    For this pipeline, the parse_document task receives the fetched
-    dict from the previous chain step, so args[0] looks like
-    {'doc_id': ..., 'ok': True, 'bytes': ...}. The body doesn't read
-    this (notify.si ignores header results), but it's useful for
-    downstream observability / for a body that DID inspect the
-    envelope shape (FM-1 style)."""
-    try:
-        first = args[0]
-        if isinstance(first, dict):
-            return first.get("doc_id")
-    except (IndexError, TypeError):
-        pass
-    return None
+    """Beat task — see shared/dlq.py and module docstring for the protocol."""
+    from shared.dlq import drain_dlq_messages
+    drain_dlq_messages(app, dead_letter_queue)
 
 
 app.conf.beat_schedule = {
