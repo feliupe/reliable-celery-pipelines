@@ -136,6 +136,13 @@ from celery.exceptions import MaxRetriesExceededError, Retry, SoftTimeLimitExcee
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.idempotency import (
+    read_lock_contention_count,
+    read_send_count,
+    reset_lock_contention_count,
+    reset_send_count,
+    send_email,
+)
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
@@ -385,31 +392,6 @@ def _notify_state_key(pipeline_id: str) -> str:
 
 SEND_COUNT_KEY = "fm6:send_email:count"
 LOCK_CONTENTION_KEY = "fm6:notify:lock_contention_count"
-SEND_EMAIL_DURATION_SECONDS = 3
-
-
-def send_email(message: str) -> None:
-    print(f"  send_email: {message} (taking {SEND_EMAIL_DURATION_SECONDS}s...)")
-    time.sleep(SEND_EMAIL_DURATION_SECONDS)
-    redis_client.incr(SEND_COUNT_KEY)
-
-
-def _reset_send_count() -> None:
-    redis_client.delete(SEND_COUNT_KEY)
-
-
-def _read_send_count() -> int:
-    raw = redis_client.get(SEND_COUNT_KEY)
-    return int(raw) if raw else 0
-
-
-def _reset_lock_contention_count() -> None:
-    redis_client.delete(LOCK_CONTENTION_KEY)
-
-
-def _read_lock_contention_count() -> int:
-    raw = redis_client.get(LOCK_CONTENTION_KEY)
-    return int(raw) if raw else 0
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +516,9 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
         f"Your pipeline documents are ready. "
         f"Id: {pipeline_id}. "
         f"Processed: {len(ok)}. "
-        f"Failed: {len(failed)}."
+        f"Failed: {len(failed)}.",
+        redis_client,
+        SEND_COUNT_KEY,
     )
     redis_client.set(state_key, NOTIFY_STATE_SENT)
 
@@ -614,8 +598,8 @@ def run_pipeline() -> None:
     state_key = _notify_state_key(pipeline_id)
 
     _reset(docs)
-    _reset_send_count()
-    _reset_lock_contention_count()
+    reset_send_count(redis_client, SEND_COUNT_KEY)
+    reset_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     redis_client.delete(state_key)
 
     header = [fetch_document.s(d) | parse_document.s() for d in docs]
@@ -654,8 +638,8 @@ def run_pipeline() -> None:
     assert first["sent"] is True
     assert second["sent"] is False
     assert first["pipeline_id"] == pipeline_id
-    sends = _read_send_count()
-    contention = _read_lock_contention_count()
+    sends = read_send_count(redis_client, SEND_COUNT_KEY)
+    contention = read_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
     assert sends == 1, f"send_email should run exactly once; got {sends}"

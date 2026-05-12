@@ -59,7 +59,6 @@ from __future__ import annotations
 
 import os
 import signal
-import time
 import uuid
 
 import redis
@@ -67,6 +66,13 @@ from celery import Celery, chord
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.idempotency import (
+    read_lock_contention_count,
+    read_send_count,
+    reset_lock_contention_count,
+    reset_send_count,
+    send_email,
+)
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
@@ -158,37 +164,8 @@ def _notify_state_key(pipeline_id: str) -> str:
     return f"fm4:notify:state:{pipeline_id}"
 
 
-# Real email APIs take 1–3s on a healthy day. We model that so the
-# lock is genuinely held when the duplicate arrives — without the
-# sleep the chord's notify finishes before the duplicate fires and
-# the busy-retry branch is never exercised.
 SEND_COUNT_KEY = "fm4:send_email:count"
 LOCK_CONTENTION_KEY = "fm4:notify:lock_contention_count"
-SEND_EMAIL_DURATION_SECONDS = 3
-
-
-def send_email(message: str) -> None:
-    print(f"  send_email: {message} (taking {SEND_EMAIL_DURATION_SECONDS}s...)")
-    time.sleep(SEND_EMAIL_DURATION_SECONDS)
-    redis_client.incr(SEND_COUNT_KEY)
-
-
-def _reset_send_count() -> None:
-    redis_client.delete(SEND_COUNT_KEY)
-
-
-def _read_send_count() -> int:
-    raw = redis_client.get(SEND_COUNT_KEY)
-    return int(raw) if raw else 0
-
-
-def _reset_lock_contention_count() -> None:
-    redis_client.delete(LOCK_CONTENTION_KEY)
-
-
-def _read_lock_contention_count() -> int:
-    raw = redis_client.get(LOCK_CONTENTION_KEY)
-    return int(raw) if raw else 0
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +247,9 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
         f"Your pipeline documents are ready. "
         f"Id: {pipeline_id}. "
         f"Processed: {len(ok)}. "
-        f"Failed: {len(failed)}."
+        f"Failed: {len(failed)}.",
+        redis_client,
+        SEND_COUNT_KEY,
     )
     # SET without `ex` clears the TTL — the sent fact is permanent.
     # INCR would inherit the lock's TTL and the marker could age out
@@ -333,8 +312,8 @@ def run_pipeline() -> None:
     state_key = _notify_state_key(pipeline_id)
 
     _reset(docs)
-    _reset_send_count()
-    _reset_lock_contention_count()
+    reset_send_count(redis_client, SEND_COUNT_KEY)
+    reset_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     redis_client.delete(state_key)
 
     # .s() instead of .si() so header results flow into notify.
@@ -382,8 +361,8 @@ def run_pipeline() -> None:
     assert second["sent"] is False, "duplicate should have skipped send_email"
     assert first["pipeline_id"] == pipeline_id
 
-    sends = _read_send_count()
-    contention = _read_lock_contention_count()
+    sends = read_send_count(redis_client, SEND_COUNT_KEY)
+    contention = read_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
     assert sends == 1, (
