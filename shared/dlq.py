@@ -9,13 +9,16 @@ Why mark_as_done (SUCCESS) rather than mark_as_failure
 A chord member written with state=FAILURE causes _unpack_chord_result
 (celery/backends/redis.py) to raise ChordError when collecting results,
 sending the failure to the body's link_error rather than firing the body.
-Writing SUCCESS with an {ok: False, error: ...} envelope lets the chord
-coordinator advance normally and delivers the failure detail to notify.
+Writing SUCCESS with a Result(status="FAILURE") envelope lets the chord
+coordinator advance normally and delivers the failure detail to notify,
+which inspects result.status rather than the Celery task state.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
+
+from shared.result import FetchPayload, Result
 
 if TYPE_CHECKING:
     from celery import Celery
@@ -74,12 +77,18 @@ def _finalize_dlq_message(app: Celery, msg: Any) -> None:
     context.chord = app.signature(chord_sig)
     context.task = task_name
 
-    envelope = {
-        "doc_id": _infer_doc_id_from_args(args),
-        "ok": False,
-        "error": "DLQ'd: x-delivery-limit exceeded",
-        "task_id": task_id,
-    }
+    doc_id = _infer_doc_id_from_args(args)
+    context = FetchPayload(doc_id=doc_id, bytes=0) if doc_id else None
+    envelope = Result.failure(
+        "DLQ'd: x-delivery-limit exceeded",
+        # attempts is None — the broker counted redeliveries, not Python retries
+        attempts=None,
+        context=context,
+    ).to_celery_dict()
+    # Embed task_id in the payload dict for downstream observability
+    if envelope["payload"] is None:
+        envelope["payload"] = {}
+    envelope["payload"]["task_id"] = task_id
     print(
         f"drain_dlq: finalizing chord-member {task_id} "
         f"(group={group_id}, task={task_name}) with envelope"
@@ -91,13 +100,18 @@ def _finalize_dlq_message(app: Celery, msg: Any) -> None:
 def _infer_doc_id_from_args(args: Any) -> str | None:
     """Best-effort: extract doc_id from the task's positional args.
 
-    parse_document receives the fetched dict from the prior chain step,
-    so args[0] looks like {'doc_id': ..., 'ok': True, 'bytes': ...}.
+    After the envelope migration, parse_document receives a serialized
+    Result[FetchPayload] dict as its first arg, so args[0] looks like
+    {"status": "SUCCESS", "payload": {"doc_id": ..., "bytes": ...}, ...}.
     """
     try:
         first = args[0]
-        if isinstance(first, dict):
-            return first.get("doc_id")
+        if not isinstance(first, dict):
+            return None
+        if "status" in first and "payload" in first:
+            payload = first.get("payload") or {}
+            return payload.get("doc_id")
+        return first.get("doc_id")
     except (IndexError, TypeError):
         pass
     return None
