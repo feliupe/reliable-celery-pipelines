@@ -66,6 +66,11 @@ from celery import Celery, chord
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.fm_asserts import (
+    assert_fm1_chord_body_fired,
+    assert_fm3_poison_bounded_at_dlq,
+    assert_fm4_notify_idempotent,
+)
 from shared.idempotency import (
     read_lock_contention_count,
     read_send_count,
@@ -357,37 +362,21 @@ def run_pipeline() -> None:
     print(f"chord notify result:     {first}")
     print(f"duplicate notify result: {second}")
 
-    assert first["sent"] is True, "chord notify should have sent the email"
-    assert second["sent"] is False, "duplicate should have skipped send_email"
-    assert first["pipeline_id"] == pipeline_id
-
     sends = read_send_count(redis_client, SEND_COUNT_KEY)
     contention = read_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
-    assert sends == 1, (
-        f"send_email should have run exactly once across both notifies, got {sends}"
-    )
-    # Proves the busy-retry branch fired. Without this the demo
-    # would still pass if the duplicate fast-pathed straight to SENT.
-    assert contention >= 1, (
-        f"expected ≥1 lock-contention retry, got {contention}"
-    )
 
     doc1_attempts = _read_attempts("doc1")
     doc2_attempts = _read_attempts("doc2")
     print("attempts (from Redis):")
-    print(
-        f"  doc1: {doc1_attempts} "
-        f"(expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)"
-    )
+    print(f"  doc1: {doc1_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
-    assert DELIVERY_LIMIT <= doc1_attempts <= DELIVERY_LIMIT + 1, (
-        f"doc1 should have crashed ~{DELIVERY_LIMIT} times before DLQ; "
-        f"got {doc1_attempts}"
-    )
-    assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"
 
+    assert_fm1_chord_body_fired(first)
+    assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
+    assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"
+    assert_fm4_notify_idempotent(first, second, pipeline_id, sends, contention)
     print(
         f"FM-4 fixed: send_email idempotent (1 send across 2 notifies); "
         f"busy-retry exercised ({contention}x)."

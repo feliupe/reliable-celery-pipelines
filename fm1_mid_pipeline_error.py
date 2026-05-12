@@ -20,6 +20,7 @@ import os
 
 from celery import Celery, chord
 
+from shared.fm_asserts import assert_fm1_chord_body_fired
 from shared.wait import wait_until
 
 app = Celery(
@@ -68,8 +69,9 @@ def run_pipeline() -> None:
     )
     value = result.get(timeout=1)
     print(f"pipeline result: {value}")
-    assert "final" in value, "Notify task did not run."
-    print(f"Notify task run with 2 errors as expected.")
+
+    assert_fm1_chord_body_fired(value)
+    print("FM-1 fixed: notify ran despite header task failures.")
 
 
 if __name__ == "__main__":

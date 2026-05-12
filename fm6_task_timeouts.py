@@ -136,6 +136,14 @@ from celery.exceptions import MaxRetriesExceededError, Retry, SoftTimeLimitExcee
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.fm_asserts import (
+    assert_fm1_chord_body_fired,
+    assert_fm3_poison_bounded_at_dlq,
+    assert_fm4_notify_idempotent,
+    assert_fm5_doc_attempts,
+    assert_fm5_retryable_result,
+    assert_fm6_hang_envelopes,
+)
 from shared.idempotency import (
     read_lock_contention_count,
     read_send_count,
@@ -634,41 +642,28 @@ def run_pipeline() -> None:
     print(f"chord notify result:     {first}")
     print(f"duplicate notify result: {second}")
 
-    # FM-4 preserved: idempotency on notify.
-    assert first["sent"] is True
-    assert second["sent"] is False
-    assert first["pipeline_id"] == pipeline_id
     sends = read_send_count(redis_client, SEND_COUNT_KEY)
     contention = read_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
-    assert sends == 1, f"send_email should run exactly once; got {sends}"
-    assert contention >= 1, f"expected ≥1 lock-contention retry; got {contention}"
 
-    # FM-6: 1 success (doc2), 4 envelopes (doc1 DLQ, doc3 retry-exhaust,
-    # doc4 soft-timeout envelope, doc5 manual-hard-timeout envelope).
-    assert first["ok"] == 1, f"expected 1 ok (doc2); got {first['ok']}"
-    assert first["failed"] == 4, (
-        f"expected 4 failed (doc1 DLQ, doc3 retry-exhaust, "
-        f"doc4 soft-timeout, doc5 manual-hard-timeout); got {first['failed']}"
-    )
-
+    doc1_attempts = _read_attempts("doc1")
     print("parse_document entries (from Redis):")
     for d in docs:
         actual = _read_attempts(d)
         expected = _expected_attempts(d)
         print(f"  {d}: {actual} (expected {expected}, schedule={FLAKE_SCHEDULE[d]})")
-        if FLAKE_SCHEDULE[d] is POISON:
-            # ±1 tolerance — exact x-delivery-count inclusive/exclusive
-            # semantics vary slightly between RabbitMQ versions.
-            assert (
-                expected <= actual <= expected + 1
-            ), f"{d}: expected ~{expected} attempts; got {actual}"
-        else:
-            assert (
-                actual == expected
-            ), f"{d}: expected {expected} attempts; got {actual}"
 
+    assert_fm1_chord_body_fired(first)
+    assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
+    assert_fm4_notify_idempotent(first, second, pipeline_id, sends, contention)
+    assert_fm5_retryable_result(first, expected_ok=1, expected_failed=4)
+    for d in docs:
+        assert_fm5_doc_attempts(
+            d, _read_attempts(d), _expected_attempts(d),
+            is_poison=(FLAKE_SCHEDULE[d] is POISON),
+        )
+    assert_fm6_hang_envelopes(first, expected_ok=1, expected_failed=4)
     print(
         f"FM-6 fixed: doc4 hang → soft timeout → envelope; "
         f"doc5 hang → manual hard timeout → envelope. "

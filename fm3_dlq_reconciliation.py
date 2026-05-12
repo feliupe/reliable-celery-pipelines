@@ -98,6 +98,7 @@ from celery import Celery, chord
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.fm_asserts import assert_fm1_chord_body_fired, assert_fm3_poison_bounded_at_dlq
 from shared.inspect import print_all_task_results
 from shared.wait import wait_until
 
@@ -316,28 +317,19 @@ def run_pipeline() -> None:
 
     value = chord_result.get(timeout=1)
     print(f"pipeline result: {value}")
-    assert value == {
-        "final": True,
-        "pipeline_id": pipeline_id,
-    }, f"notify did not run with the expected pipeline_id: {value}"
 
     doc1_attempts = _read_attempts("doc1")
     doc2_attempts = _read_attempts("doc2")
     print("attempts (from Redis):")
-    print(
-        f"  doc1: {doc1_attempts} "
-        f"(expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)"
-    )
+    print(f"  doc1: {doc1_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
-    # Allow ±1 around DELIVERY_LIMIT — exact x-delivery-count semantics
-    # vary slightly between RabbitMQ versions (whether the limit is
-    # inclusive/exclusive of the initial delivery).
-    assert DELIVERY_LIMIT <= doc1_attempts <= DELIVERY_LIMIT + 1, (
-        f"doc1 should have crashed ~{DELIVERY_LIMIT} times before DLQ; "
-        f"got {doc1_attempts}"
-    )
-    assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"
 
+    assert_fm1_chord_body_fired(value)
+    assert value["pipeline_id"] == pipeline_id, (
+        f"notify ran with wrong pipeline_id: {value['pipeline_id']!r}"
+    )
+    assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
+    assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"
     print(
         f"FM-3 fixed: poison capped at {doc1_attempts} crashes (DLQ); "
         f"drain_dlq finalized chord-member; body fired via native coordinator."

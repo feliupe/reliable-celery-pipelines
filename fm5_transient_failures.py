@@ -73,6 +73,13 @@ from celery.exceptions import MaxRetriesExceededError, Retry
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.fm_asserts import (
+    assert_fm1_chord_body_fired,
+    assert_fm3_poison_bounded_at_dlq,
+    assert_fm4_notify_idempotent,
+    assert_fm5_doc_attempts,
+    assert_fm5_retryable_result,
+)
 from shared.idempotency import (
     read_lock_contention_count,
     read_send_count,
@@ -488,45 +495,27 @@ def run_pipeline() -> None:
     print(f"chord notify result:     {first}")
     print(f"duplicate notify result: {second}")
 
-    # FM-4: idempotency on notify.
-    assert first["sent"] is True, "chord notify should have sent the email"
-    assert second["sent"] is False, "duplicate should have skipped send_email"
-    assert first["pipeline_id"] == pipeline_id
     sends = read_send_count(redis_client, SEND_COUNT_KEY)
     contention = read_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
-    assert sends == 1, f"send_email should run exactly once; got {sends}"
-    assert contention >= 1, f"expected ≥1 lock-contention retry; got {contention}"
 
-    # FM-5: the chord aggregated 1 success (doc2 recovered) and 2
-    # failures (doc1 via DLQ, doc3 via retryable exhaustion).
-    assert first["ok"] == 1, f"expected 1 ok (doc2 recovered); got {first['ok']}"
-    assert first["failed"] == 2, (
-        f"expected 2 failed (doc1 DLQ + doc3 exhausted); got {first['failed']}"
-    )
-
-    # Mechanical: parse_document was entered exactly the predicted
-    # number of times per doc. The `attempts` field on each envelope
-    # is task-reported and could lie; this counter is independent
-    # state only the call site can increment.
+    doc1_attempts = _read_attempts("doc1")
     print("parse_document entries (from Redis):")
     for d in docs:
         actual = _read_attempts(d)
         expected = _expected_attempts(d)
         print(f"  {d}: {actual} (expected {expected}, schedule={FLAKE_SCHEDULE[d]})")
-        # ±1 tolerance on the poison count — exact x-delivery-count
-        # inclusive/exclusive semantics vary slightly between RabbitMQ
-        # versions.
-        if FLAKE_SCHEDULE[d] is POISON:
-            assert expected <= actual <= expected + 1, (
-                f"{d}: expected ~{expected} crashes; got {actual}"
-            )
-        else:
-            assert actual == expected, (
-                f"{d}: expected {expected} calls; got {actual}"
-            )
 
+    assert_fm1_chord_body_fired(first)
+    assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
+    assert_fm4_notify_idempotent(first, second, pipeline_id, sends, contention)
+    assert_fm5_retryable_result(first, expected_ok=1, expected_failed=2)
+    for d in docs:
+        assert_fm5_doc_attempts(
+            d, _read_attempts(d), _expected_attempts(d),
+            is_poison=(FLAKE_SCHEDULE[d] is POISON),
+        )
     print(
         f"FM-5 fixed: doc2 recovered via retryable; "
         f"doc3 exhausted retries → envelope; doc1 → DLQ; "

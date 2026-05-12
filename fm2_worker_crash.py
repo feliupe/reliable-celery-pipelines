@@ -62,6 +62,7 @@ import signal
 import redis
 from celery import Celery, chord
 
+from shared.fm_asserts import assert_fm1_chord_body_fired, assert_fm2_redelivery_happened
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
@@ -153,20 +154,15 @@ def run_pipeline() -> None:
 
     value = result.get(timeout=1)
     print(f"pipeline result: {value}")
-    assert "final" in value, "Notify task did not run."
 
-    # Mechanical proof the redelivery actually happened: parse ran
-    # twice for doc1 (crash + redelivery) and once for doc2.
     doc1_attempts = _read_attempts("doc1")
     doc2_attempts = _read_attempts("doc2")
     print("parse attempts (from Redis):")
     print(f"  doc1: {doc1_attempts} (expected 2 — crash + redelivery)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
-    assert doc1_attempts == 2, (
-        f"doc1 should have run twice (crash + redelivery); got {doc1_attempts}"
-    )
-    assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"
 
+    assert_fm1_chord_body_fired(value)
+    assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     print("FM-2 fixed: SIGKILL'd parse_document was redelivered and completed.")
 
 
