@@ -119,12 +119,17 @@ Run
   python fm6_task_timeouts.py
 """
 
+from __future__ import annotations
+
 import functools
+import json
 import os
 import random
 import signal
 import time
 import uuid
+from collections.abc import Callable
+from typing import Any
 
 import redis
 from celery import Celery, chord
@@ -181,7 +186,7 @@ app.conf.task_default_exchange = "fm6.pipeline"
 app.conf.task_default_routing_key = "pipeline"
 
 
-def _declare_dlq_topology():
+def _declare_dlq_topology() -> None:
     with app.connection_for_write() as conn:
         with conn.channel() as ch:
             dlx_exchange.declare(channel=ch)
@@ -233,9 +238,9 @@ class TransientServiceError(Exception):
     service."""
 
 
-def always_returns_envelope(func):
+def always_returns_envelope(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
+    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
         try:
             return func(self, *args, **kwargs)
         except Retry:
@@ -252,10 +257,15 @@ def always_returns_envelope(func):
     return wrapper
 
 
-def retryable(retriable_exceptions=(), max_retries=3, backoff_base=2, backoff_cap=10):
-    def decorator(func):
+def retryable(
+    retriable_exceptions: tuple[type[BaseException], ...] = (),
+    max_retries: int = 3,
+    backoff_base: int = 2,
+    backoff_cap: int = 10,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
-        def wrapper(self, *args, **kwargs):
+        def wrapper(self, *args: Any, **kwargs: Any) -> Any:
             try:
                 return func(self, *args, **kwargs)
             except retriable_exceptions as exc:
@@ -284,7 +294,9 @@ class HardTimeoutExceeded(Exception):
     """Raised by @hard_timeout when the per-task budget is exceeded."""
 
 
-def hard_timeout(seconds):
+def hard_timeout(
+    seconds: float,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Manual per-task hard timeout via signal.setitimer + SIGALRM.
 
     Bypasses Celery's time_limit because that path writes a
@@ -304,10 +316,10 @@ def hard_timeout(seconds):
     body, not decorator overhead.
     """
 
-    def decorator(func):
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
-        def wrapper(self, *args, **kwargs):
-            def _on_alarm(signum, frame):
+        def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+            def _on_alarm(signum, frame) -> None:
                 raise HardTimeoutExceeded(
                     f"{self.name} exceeded {seconds}s hard timeout"
                 )
@@ -405,7 +417,7 @@ def _read_lock_contention_count() -> int:
 @always_returns_envelope
 @retryable(retriable_exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
 @hard_timeout(MANUAL_HARD_TIMEOUT_SECONDS)
-def fetch_document(self, doc_id):
+def fetch_document(self, doc_id: str) -> dict:
     return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
 
 
@@ -420,7 +432,7 @@ def fetch_document(self, doc_id):
 @always_returns_envelope
 @retryable(retriable_exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
 @hard_timeout(MANUAL_HARD_TIMEOUT_SECONDS)
-def parse_document(self, fetched):
+def parse_document(self, fetched: dict) -> dict:
     doc_id = fetched["doc_id"]
     attempts = redis_client.incr(_attempts_key(doc_id))
     schedule = FLAKE_SCHEDULE.get(doc_id, 0)
@@ -476,7 +488,7 @@ def parse_document(self, fetched):
     soft_time_limit=NOTIFY_SOFT_TIMEOUT_SECONDS,
     time_limit=NOTIFY_HARD_TIMEOUT_SECONDS,
 )
-def notify(self, results, pipeline_id):
+def notify(self, results: list[dict], pipeline_id: str) -> dict:
     """See fm4_duplicated_runs.py for the idempotency contract. Not
     decorated — the chord-body return shape is {sent: True/False}
     and @always_returns_envelope would clobber that on any failure."""
@@ -523,7 +535,7 @@ def notify(self, results, pipeline_id):
     return _summary(results, pipeline_id, sent=True)
 
 
-def _summary(results, pipeline_id, sent):
+def _summary(results: list[dict], pipeline_id: str, sent: bool) -> dict:
     ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
     failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
     return {
@@ -536,7 +548,7 @@ def _summary(results, pipeline_id, sent):
 
 
 @app.task(name="drain_dlq")
-def drain_dlq():
+def drain_dlq() -> None:
     with app.connection_for_write() as conn:
         with conn.channel() as ch:
             bound_dlq = dead_letter_queue(ch)
@@ -547,7 +559,7 @@ def drain_dlq():
                 _finalize_dlq_message(msg)
 
 
-def _finalize_dlq_message(msg):
+def _finalize_dlq_message(msg) -> None:
     headers = msg.headers or {}
     task_id = headers.get("id")
     group_id = headers.get("group")
@@ -588,7 +600,7 @@ def _finalize_dlq_message(msg):
     msg.ack()
 
 
-def _infer_doc_id_from_args(args):
+def _infer_doc_id_from_args(args) -> str | None:
     try:
         first = args[0]
         if isinstance(first, dict):
@@ -611,7 +623,7 @@ app.conf.beat_schedule = {
 # ---------------------------------------------------------------------------
 
 
-def _reset(doc_ids):
+def _reset(doc_ids: list[str]) -> None:
     keys = [_attempts_key(d) for d in doc_ids]
     if keys:
         redis_client.delete(*keys)
@@ -641,12 +653,10 @@ def _expected_attempts(doc_id: str) -> int:
     return schedule + 1
 
 
-def print_all_task_results():
+def print_all_task_results() -> None:
     """Scan the Redis backend for every `celery-task-meta-*` key and
     print task_id, state, task name, and result/error."""
-    import json
-
-    states = {}
+    states: dict[str, int] = {}
     for key in redis_client.scan_iter(match="celery-task-meta-*"):
         raw = redis_client.get(key)
         if not raw:
@@ -663,7 +673,7 @@ def print_all_task_results():
     print(f"backend totals: {summary or '(no task results found)'}")
 
 
-def run_pipeline():
+def run_pipeline() -> None:
     docs = list(FLAKE_SCHEDULE.keys())
     pipeline_id = str(uuid.uuid4())
     state_key = _notify_state_key(pipeline_id)

@@ -15,6 +15,8 @@ Run instructions
 
 """
 
+from __future__ import annotations
+
 import os
 import time
 
@@ -34,7 +36,7 @@ app = Celery(
 # which can be `__main__` for the client vs the module name for the
 # worker. Explicit names sidestep the mismatch entirely.
 @app.task(name="fetch_document")
-def fetch_document(doc_id):
+def fetch_document(doc_id: str) -> dict:
     return {"doc_id": doc_id, "bytes": len(doc_id) * 100}
 
 
@@ -43,7 +45,7 @@ def fetch_document(doc_id):
 # raised exception propagates: no try/except, no retry, no errback. That
 # is the whole point of FM-1.
 @app.task(name="parse_document")
-def parse_document(fetched):
+def parse_document(fetched: dict) -> dict:
     doc_id = fetched["doc_id"]
 
     raise RuntimeError(f"parser crashed on {doc_id}")
@@ -51,12 +53,12 @@ def parse_document(fetched):
 
 
 @app.task(name="notify")
-def notify(results):
+def notify(results: list[dict]) -> dict:
     print(f"notify aggregated: {results}")
     return {"final": True, "results": results}
 
 
-def run_pipeline():
+def run_pipeline() -> None:
     docs = ["doc1", "doc2"]
     header = [fetch_document.s(d) | parse_document.s() for d in docs]
     print(

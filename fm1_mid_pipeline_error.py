@@ -14,6 +14,8 @@ Run
   FAIL_PARSE=0 python fm1_mid_pipeline_error.py     # happy path
 """
 
+from __future__ import annotations
+
 import os
 import time
 
@@ -27,12 +29,12 @@ app = Celery(
 
 
 @app.task(name="fetch_document")
-def fetch_document(doc_id):
+def fetch_document(doc_id: str) -> dict:
     return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
 
 
 @app.task(name="parse_document")
-def parse_document(fetched):
+def parse_document(fetched: dict) -> dict:
     doc_id = fetched["doc_id"]
     try:
         if os.environ.get("FAIL_PARSE", "1") == "1":
@@ -43,7 +45,7 @@ def parse_document(fetched):
 
 
 @app.task(name="notify")
-def notify(results):
+def notify(results: list[dict]) -> dict:
     ok = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
     print(f"notify: {len(ok)} ok, {len(failed)} failed")
@@ -52,7 +54,7 @@ def notify(results):
     return {"final": True, "ok": len(ok), "failed": len(failed), "results": results}
 
 
-def run_pipeline():
+def run_pipeline() -> None:
     docs = ["doc1", "doc2"]
     header = [fetch_document.s(d) | parse_document.s() for d in docs]
     pipeline = chord(header, body=notify.s())

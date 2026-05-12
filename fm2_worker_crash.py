@@ -54,6 +54,8 @@ message immediately rather than waiting for the master to respawn the
 killed child. Both work; >= 2 is faster and timing-stable.
 """
 
+from __future__ import annotations
+
 import os
 import signal
 import time
@@ -85,12 +87,12 @@ def _attempts_key(doc_id: str) -> str:
 # exercises the flags on parse_document (it's the one that crashes),
 # but the uniform application matches realistic config.
 @app.task(name="fetch_document", acks_late=True, reject_on_worker_lost=True)
-def fetch_document(doc_id):
+def fetch_document(doc_id: str) -> dict:
     return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
 
 
 @app.task(name="parse_document", acks_late=True, reject_on_worker_lost=True)
-def parse_document(fetched):
+def parse_document(fetched: dict) -> dict:
     doc_id = fetched["doc_id"]
     attempts = redis_client.incr(_attempts_key(doc_id))
 
@@ -106,7 +108,7 @@ def parse_document(fetched):
 
 
 @app.task(name="notify", acks_late=True, reject_on_worker_lost=True)
-def notify(results):
+def notify(results: list[dict]) -> dict:
     ok = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
     print(f"notify: {len(ok)} ok, {len(failed)} failed")
@@ -117,7 +119,7 @@ def notify(results):
     return {"final": True, "ok": len(ok), "failed": len(failed), "results": results}
 
 
-def _reset(doc_ids):
+def _reset(doc_ids: list[str]) -> None:
     keys = [_attempts_key(d) for d in doc_ids]
     if keys:
         redis_client.delete(*keys)
@@ -128,7 +130,7 @@ def _read_attempts(doc_id: str) -> int:
     return int(raw) if raw else 0
 
 
-def run_pipeline():
+def run_pipeline() -> None:
     docs = ["doc1", "doc2"]
     _reset(docs)
 

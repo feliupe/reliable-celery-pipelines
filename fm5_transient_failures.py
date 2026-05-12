@@ -57,12 +57,17 @@ Run
   python fm5_transient_failures.py
 """
 
+from __future__ import annotations
+
 import functools
+import json
 import os
 import random
 import signal
 import time
 import uuid
+from collections.abc import Callable
+from typing import Any
 
 import redis
 from celery import Celery, chord
@@ -120,7 +125,7 @@ app.conf.task_default_exchange = "fm5.pipeline"
 app.conf.task_default_routing_key = "pipeline"
 
 
-def _declare_dlq_topology():
+def _declare_dlq_topology() -> None:
     with app.connection_for_write() as conn:
         with conn.channel() as ch:
             dlx_exchange.declare(channel=ch)
@@ -153,7 +158,7 @@ class TransientServiceError(Exception):
     service. In real code these are mapped from the HTTP client."""
 
 
-def always_returns_envelope(func):
+def always_returns_envelope(func: Callable[..., Any]) -> Callable[..., Any]:
     """Convert any escaping exception into a `{ok: False, error: ...}`
     payload so the chord aggregator sees a uniform list of outcomes.
 
@@ -167,7 +172,7 @@ def always_returns_envelope(func):
     """
 
     @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
+    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
         try:
             return func(self, *args, **kwargs)
         except Retry:
@@ -184,7 +189,12 @@ def always_returns_envelope(func):
     return wrapper
 
 
-def retryable(retriable_exceptions=(), max_retries=3, backoff_base=2, backoff_cap=10):
+def retryable(
+    retriable_exceptions: tuple[type[BaseException], ...] = (),
+    max_retries: int = 3,
+    backoff_base: int = 2,
+    backoff_cap: int = 10,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Catch the named exceptions and retry with exponential backoff +
     jitter, up to max_retries. After exhaustion, re-raise the original
     exception so @always_returns_envelope can turn it into a payload.
@@ -198,9 +208,9 @@ def retryable(retriable_exceptions=(), max_retries=3, backoff_base=2, backoff_ca
     @always_returns_envelope.
     """
 
-    def decorator(func):
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
-        def wrapper(self, *args, **kwargs):
+        def wrapper(self, *args: Any, **kwargs: Any) -> Any:
             try:
                 return func(self, *args, **kwargs)
             except retriable_exceptions as exc:
@@ -293,14 +303,14 @@ def _read_lock_contention_count() -> int:
 @app.task(name="fetch_document", bind=True, acks_late=True, reject_on_worker_lost=True)
 @always_returns_envelope
 @retryable(retriable_exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
-def fetch_document(self, doc_id):
+def fetch_document(self, doc_id: str) -> dict:
     return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
 
 
 @app.task(name="parse_document", bind=True, acks_late=True, reject_on_worker_lost=True)
 @always_returns_envelope
 @retryable(retriable_exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
-def parse_document(self, fetched):
+def parse_document(self, fetched: dict) -> dict:
     doc_id = fetched["doc_id"]
     # The counter increments on EVERY entry, regardless of outcome:
     # for doc1 it counts SIGKILL attempts (DLQ assertion); for doc2/3
@@ -331,7 +341,7 @@ def parse_document(self, fetched):
     acks_late=True,
     reject_on_worker_lost=True,
 )
-def notify(self, results, pipeline_id):
+def notify(self, results: list[dict], pipeline_id: str) -> dict:
     """Send the completion email at most once per pipeline_id.
 
     Not decorated with @retryable / @always_returns_envelope:
@@ -384,7 +394,7 @@ def notify(self, results, pipeline_id):
     return _summary(results, pipeline_id, sent=True)
 
 
-def _summary(results, pipeline_id, sent):
+def _summary(results: list[dict], pipeline_id: str, sent: bool) -> dict:
     ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
     failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
     return {
@@ -397,7 +407,7 @@ def _summary(results, pipeline_id, sent):
 
 
 @app.task(name="drain_dlq")
-def drain_dlq():
+def drain_dlq() -> None:
     with app.connection_for_write() as conn:
         with conn.channel() as ch:
             bound_dlq = dead_letter_queue(ch)
@@ -408,7 +418,7 @@ def drain_dlq():
                 _finalize_dlq_message(msg)
 
 
-def _finalize_dlq_message(msg):
+def _finalize_dlq_message(msg) -> None:
     headers = msg.headers or {}
     task_id = headers.get("id")
     group_id = headers.get("group")
@@ -449,7 +459,7 @@ def _finalize_dlq_message(msg):
     msg.ack()
 
 
-def _infer_doc_id_from_args(args):
+def _infer_doc_id_from_args(args) -> str | None:
     try:
         first = args[0]
         if isinstance(first, dict):
@@ -472,7 +482,7 @@ app.conf.beat_schedule = {
 # ---------------------------------------------------------------------------
 
 
-def _reset(doc_ids):
+def _reset(doc_ids: list[str]) -> None:
     keys = [_attempts_key(d) for d in doc_ids]
     if keys:
         redis_client.delete(*keys)
@@ -498,12 +508,10 @@ def _expected_attempts(doc_id: str) -> int:
     return schedule + 1
 
 
-def print_all_task_results():
+def print_all_task_results() -> None:
     """Scan the Redis backend for every `celery-task-meta-*` key and
     print task_id, state, task name, and result/error."""
-    import json
-
-    states = {}
+    states: dict[str, int] = {}
     for key in redis_client.scan_iter(match="celery-task-meta-*"):
         raw = redis_client.get(key)
         if not raw:
@@ -520,7 +528,7 @@ def print_all_task_results():
     print(f"backend totals: {summary or '(no task results found)'}")
 
 
-def run_pipeline():
+def run_pipeline() -> None:
     docs = ["doc1", "doc2", "doc3"]
     pipeline_id = str(uuid.uuid4())
     state_key = _notify_state_key(pipeline_id)

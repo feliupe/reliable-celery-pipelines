@@ -87,6 +87,9 @@ new args. Reset with `docker-compose down -v` if startup fails on
 PRECONDITION_FAILED.
 """
 
+from __future__ import annotations
+
+import json
 import os
 import signal
 import time
@@ -159,7 +162,7 @@ app.conf.task_default_exchange = "fm3.pipeline"
 app.conf.task_default_routing_key = "pipeline"
 
 
-def _declare_dlq_topology():
+def _declare_dlq_topology() -> None:
     """Declare the DLX exchange and DLQ on the broker so the
     pipeline queue's dead-lettering has a target. Idempotent — safe
     to call from both worker and driver processes at import time."""
@@ -207,12 +210,12 @@ def _attempts_key(doc_id: str) -> str:
 
 
 @app.task(name="fetch_document", acks_late=True, reject_on_worker_lost=True)
-def fetch_document(doc_id):
+def fetch_document(doc_id: str) -> dict:
     return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
 
 
 @app.task(name="parse_document", acks_late=True, reject_on_worker_lost=True)
-def parse_document(fetched):
+def parse_document(fetched: dict) -> dict:
     """doc1 simulates a poison message: every execution SIGKILLs the
     worker mid-task. With FM-2's flags each crash requeues; with
     x-delivery-limit, redelivery is capped and the broker
@@ -232,7 +235,7 @@ def parse_document(fetched):
 
 
 @app.task(name="notify", acks_late=True, reject_on_worker_lost=True)
-def notify(pipeline_id):
+def notify(pipeline_id: str) -> dict:
     """The chord body. Takes a pipeline identifier, not the header
     results — in a real system it queries a database for per-doc
     state of this run and dispatches downstream actions.
@@ -249,7 +252,7 @@ def notify(pipeline_id):
 
 
 @app.task(name="drain_dlq")
-def drain_dlq():
+def drain_dlq() -> None:
     """Beat task. Pulls all messages currently in fm3.dead_letters
     and writes a SUCCESS-state envelope to the result backend for
     each, with the original chord context attached. That triggers
@@ -272,7 +275,7 @@ def drain_dlq():
                 _finalize_dlq_message(msg)
 
 
-def _finalize_dlq_message(msg):
+def _finalize_dlq_message(msg) -> None:
     """Extract chord context from a DLQ'd task message and finalize
     it as a successful (envelope-payload) result.
 
@@ -333,7 +336,7 @@ def _finalize_dlq_message(msg):
     msg.ack()
 
 
-def _infer_doc_id_from_args(args):
+def _infer_doc_id_from_args(args) -> str | None:
     """Best-effort recovery of the input identity for the envelope.
     For this pipeline, the parse_document task receives the fetched
     dict from the previous chain step, so args[0] looks like
@@ -363,19 +366,17 @@ app.conf.beat_schedule = {
 # ---------------------------------------------------------------------------
 
 
-def _reset(doc_ids):
+def _reset(doc_ids: list[str]) -> None:
     keys = [_attempts_key(d) for d in doc_ids]
     if keys:
         redis_client.delete(*keys)
 
 
-def print_all_task_results():
+def print_all_task_results() -> None:
     """Scan the Redis backend for every `celery-task-meta-*` key and
     print task_id, state, task name, and result/error. Useful after a
     run to confirm every header + body landed in SUCCESS."""
-    import json
-
-    states = {}
+    states: dict[str, int] = {}
     for key in redis_client.scan_iter(match="celery-task-meta-*"):
         raw = redis_client.get(key)
         if not raw:
@@ -397,7 +398,7 @@ def _read_attempts(doc_id: str) -> int:
     return int(raw) if raw else 0
 
 
-def run_pipeline():
+def run_pipeline() -> None:
     docs = ["doc1", "doc2"]
     _reset(docs)
 

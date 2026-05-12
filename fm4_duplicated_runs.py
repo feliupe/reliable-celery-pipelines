@@ -55,6 +55,9 @@ duplicate notify is queued behind the chord's notify and never lands
 while the lock is held, so the busy-retry branch never fires.
 """
 
+from __future__ import annotations
+
+import json
 import os
 import signal
 import time
@@ -116,7 +119,7 @@ app.conf.task_default_exchange = "fm4.pipeline"
 app.conf.task_default_routing_key = "pipeline"
 
 
-def _declare_dlq_topology():
+def _declare_dlq_topology() -> None:
     with app.connection_for_write() as conn:
         with conn.channel() as ch:
             dlx_exchange.declare(channel=ch)
@@ -194,12 +197,12 @@ def _read_lock_contention_count() -> int:
 
 
 @app.task(name="fetch_document", acks_late=True, reject_on_worker_lost=True)
-def fetch_document(doc_id):
+def fetch_document(doc_id: str) -> dict:
     return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
 
 
 @app.task(name="parse_document", acks_late=True, reject_on_worker_lost=True)
-def parse_document(fetched):
+def parse_document(fetched: dict) -> dict:
     doc_id = fetched["doc_id"]
     attempts = redis_client.incr(_attempts_key(doc_id))
 
@@ -221,7 +224,7 @@ def parse_document(fetched):
     acks_late=True,
     reject_on_worker_lost=True,
 )
-def notify(self, results, pipeline_id):
+def notify(self, results: list[dict], pipeline_id: str) -> dict:
     """Send the completion email at most once per pipeline_id.
 
     Three branches, keyed off the lock state:
@@ -282,7 +285,7 @@ def notify(self, results, pipeline_id):
     return _summary(results, pipeline_id, sent=True)
 
 
-def _summary(results, pipeline_id, sent):
+def _summary(results: list[dict], pipeline_id: str, sent: bool) -> dict:
     ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
     failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
     return {
@@ -295,7 +298,7 @@ def _summary(results, pipeline_id, sent):
 
 
 @app.task(name="drain_dlq")
-def drain_dlq():
+def drain_dlq() -> None:
     with app.connection_for_write() as conn:
         with conn.channel() as ch:
             bound_dlq = dead_letter_queue(ch)
@@ -306,7 +309,7 @@ def drain_dlq():
                 _finalize_dlq_message(msg)
 
 
-def _finalize_dlq_message(msg):
+def _finalize_dlq_message(msg) -> None:
     headers = msg.headers or {}
     task_id = headers.get("id")
     group_id = headers.get("group")
@@ -347,7 +350,7 @@ def _finalize_dlq_message(msg):
     msg.ack()
 
 
-def _infer_doc_id_from_args(args):
+def _infer_doc_id_from_args(args) -> str | None:
     try:
         first = args[0]
         if isinstance(first, dict):
@@ -370,18 +373,16 @@ app.conf.beat_schedule = {
 # ---------------------------------------------------------------------------
 
 
-def _reset(doc_ids):
+def _reset(doc_ids: list[str]) -> None:
     keys = [_attempts_key(d) for d in doc_ids]
     if keys:
         redis_client.delete(*keys)
 
 
-def print_all_task_results():
+def print_all_task_results() -> None:
     """Scan the Redis backend for every `celery-task-meta-*` key and
     print task_id, state, task name, and result/error."""
-    import json
-
-    states = {}
+    states: dict[str, int] = {}
     for key in redis_client.scan_iter(match="celery-task-meta-*"):
         raw = redis_client.get(key)
         if not raw:
@@ -403,7 +404,7 @@ def _read_attempts(doc_id: str) -> int:
     return int(raw) if raw else 0
 
 
-def run_pipeline():
+def run_pipeline() -> None:
     docs = ["doc1", "doc2"]
     pipeline_id = str(uuid.uuid4())
     state_key = _notify_state_key(pipeline_id)
