@@ -332,7 +332,9 @@ def hard_timeout(seconds):
 POISON = "poison"  # SIGKILL the worker (FM-3 path)
 FLAKE_FOREVER = -1  # always raise TransientServiceError (FM-5 envelope path)
 SOFT_HANG = "soft_hang"  # hang past soft limit, envelope via @always_returns_envelope
-HARD_HANG_MANUAL = "hard_hang_manual"  # hang, ignore soft, manual @hard_timeout fires → envelope
+HARD_HANG_MANUAL = (
+    "hard_hang_manual"  # hang, ignore soft, manual @hard_timeout fires → envelope
+)
 
 
 FLAKE_SCHEDULE = {
@@ -623,11 +625,11 @@ def _read_attempts(doc_id: str) -> int:
 def _expected_attempts(doc_id: str) -> int:
     """parse_document entries per doc.
 
-      POISON                       → DELIVERY_LIMIT (broker cap)
-      SOFT_HANG / HARD_HANG_MANUAL → 1 (no retry — timeout exceptions
-                                       not in retriable_exceptions)
-      FLAKE_FOREVER                → 1 + MAX_RETRIES
-      N (int ≥ 0)                  → N + 1
+    POISON                       → DELIVERY_LIMIT (broker cap)
+    SOFT_HANG / HARD_HANG_MANUAL → 1 (no retry — timeout exceptions
+                                     not in retriable_exceptions)
+    FLAKE_FOREVER                → 1 + MAX_RETRIES
+    N (int ≥ 0)                  → N + 1
     """
     schedule = FLAKE_SCHEDULE.get(doc_id, 0)
     if schedule == POISON:
@@ -685,9 +687,9 @@ def run_pipeline():
     deadline = time.time() + 120
     while time.time() < deadline and not redis_client.exists(state_key):
         time.sleep(0.5)
-    assert redis_client.exists(state_key), (
-        "chord notify never claimed the lock within 120s"
-    )
+    assert redis_client.exists(
+        state_key
+    ), "chord notify never claimed the lock within 120s"
 
     print("--- triggering concurrent duplicate notify ---")
     duplicate_result = notify.delay([], pipeline_id=pipeline_id)
@@ -698,9 +700,9 @@ def run_pipeline():
         if chord_result.ready() and duplicate_result.ready():
             break
         time.sleep(0.5)
-    assert chord_result.ready() and duplicate_result.ready(), (
-        "tasks did not finish within 30s"
-    )
+    assert (
+        chord_result.ready() and duplicate_result.ready()
+    ), "tasks did not finish within 30s"
 
     first = chord_result.get(timeout=1)
     second = duplicate_result.get(timeout=1)
@@ -734,13 +736,13 @@ def run_pipeline():
         if FLAKE_SCHEDULE[d] == POISON:
             # ±1 tolerance — exact x-delivery-count inclusive/exclusive
             # semantics vary slightly between RabbitMQ versions.
-            assert expected <= actual <= expected + 1, (
-                f"{d}: expected ~{expected} attempts; got {actual}"
-            )
+            assert (
+                expected <= actual <= expected + 1
+            ), f"{d}: expected ~{expected} attempts; got {actual}"
         else:
-            assert actual == expected, (
-                f"{d}: expected {expected} attempts; got {actual}"
-            )
+            assert (
+                actual == expected
+            ), f"{d}: expected {expected} attempts; got {actual}"
 
     print(
         f"FM-6 fixed: doc4 hang → soft timeout → envelope; "
