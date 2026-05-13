@@ -6,12 +6,11 @@ idempotent notify, and acks_late survivability are inherited
 verbatim. Read those files first.
 
 Technique: bounded retries with exponential backoff + jitter,
-implemented as two reusable decorators on the task body. Stacked
-on top of @app.task in this order (top-down):
+implemented as two shared decorators from shared/decorators.py:
 
     @app.task(name=..., bind=True, acks_late=True, ...)
-    @always_returns_envelope    # converts escapes to {ok: False, ...}
-    @retryable(...)             # catches transients, schedules retry
+    @enveloped                # converts escapes to Result(status="FAILURE")
+    @transient_retryable(...) # catches transients, schedules retry
     def task(self, ...):
         ...
 
@@ -27,22 +26,18 @@ the body exits:
 
   - SIGKILL (no Python exception)     → no ack → broker redelivery →
     x-delivery-count increments → DLQ at limit → drain_dlq finalizes
-    a chord-member envelope (FM-3 path).
+    a Result(status="FAILURE") chord-member envelope (FM-3 path).
 
-  - raise TransientServiceError       → @retryable catches → self.retry
-    ACKs the original and schedules a new delivery → fresh
+  - raise TransientServiceError       → @transient_retryable catches →
+    self.retry ACKs the original and schedules a new delivery → fresh
     x-delivery-count. Transient retries DO NOT accumulate toward DLQ.
 
-  - raise TransientServiceError (exhausted) → @retryable re-raises →
-    @always_returns_envelope returns {ok: False, error: ...} → chord
-    member completes SUCCESS-state with an envelope payload (same
-    shape drain_dlq writes).
+  - raise TransientServiceError (exhausted) → @transient_retryable
+    re-raises → @enveloped returns Result(status="FAILURE") → chord
+    member completes SUCCESS Celery state with a typed FAILURE payload
+    (same shape drain_dlq writes).
 
-All three converge into notify, which aggregates by the `ok` flag.
-notify itself is NOT decorated — its FM-4 idempotency machinery is
-its own retry mechanism (busy-retry → self.retry on lock contention)
-and the chord body must return the {sent: True/False} contract, not
-an envelope.
+All three converge into notify, which aggregates by result.status.
 
 Per-doc scenario (deterministic for reproducible asserts)
 ---------------------------------------------------------
@@ -59,22 +54,20 @@ Run
 
 from __future__ import annotations
 
-import functools
 import os
-import random
 import signal
 import uuid
-from collections.abc import Callable
-from typing import Any
 
 import redis
 from celery import Celery, chord
-from celery.exceptions import MaxRetriesExceededError, Retry
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.counters import incr_attempts, read_attempts, reset_attempts
+from shared.decorators import enveloped, transient_retryable
 from shared.fm_asserts import (
     assert_fm1_chord_body_fired,
+    assert_fm2_redelivery_happened,
     assert_fm3_poison_bounded_at_dlq,
     assert_fm4_notify_idempotent,
     assert_fm5_doc_attempts,
@@ -87,9 +80,11 @@ from shared.idempotency import (
     reset_send_count,
     send_email,
 )
+from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
+ATTEMPTS_KEY_PREFIX = "fm5:attempts"
 
 app = Celery(
     "fm5_transient_failures",
@@ -157,95 +152,14 @@ DRAIN_INTERVAL_SECONDS = 5
 MAX_RETRIES = 3
 
 
-def _attempts_key(doc_id: str) -> str:
-    return f"fm5:attempts:{doc_id}"
-
-
 # ---------------------------------------------------------------------------
-# Retry decorators
+# Transient error type
 # ---------------------------------------------------------------------------
 
 
 class TransientServiceError(Exception):
     """Stand-in for 503 / connection-reset / read-timeout from an external
     service. In real code these are mapped from the HTTP client."""
-
-
-def always_returns_envelope(func: Callable[..., Any]) -> Callable[..., Any]:
-    """Convert any escaping exception into a `{ok: False, error: ...}`
-    payload so the chord aggregator sees a uniform list of outcomes.
-
-    Does NOT catch celery.exceptions.Retry — that's the signal
-    self.retry() raises to schedule a retry, and Celery's framework
-    needs to see it. Swallowing it would silently disable retries.
-
-    Must wrap the task body OUTSIDE @retryable: retryable re-raises
-    the original on exhaustion, and this decorator is what turns
-    that into the envelope.
-    """
-
-    @functools.wraps(func)
-    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(self, *args, **kwargs)
-        except Retry:
-            raise
-        except Exception as exc:
-            base = args[0] if args and isinstance(args[0], dict) else {}
-            return {
-                **base,
-                "ok": False,
-                "error": str(exc),
-                "attempts": self.request.retries + 1,
-            }
-
-    return wrapper
-
-
-def retryable(
-    retriable_exceptions: tuple[type[BaseException], ...] = (),
-    max_retries: int = 3,
-    backoff_base: int = 2,
-    backoff_cap: int = 10,
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Catch the named exceptions and retry with exponential backoff +
-    jitter, up to max_retries. After exhaustion, re-raise the original
-    exception so @always_returns_envelope can turn it into a payload.
-
-    Jitter matters under load: without it, a fleet of workers
-    retrying the same downstream service synchronizes and re-DDoSes
-    it the moment it recovers.
-
-    Innermost decorator — directly above the task body. Anything
-    raised that isn't in retriable_exceptions passes through to
-    @always_returns_envelope.
-    """
-
-    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-        @functools.wraps(func)
-        def wrapper(self, *args: Any, **kwargs: Any) -> Any:
-            try:
-                return func(self, *args, **kwargs)
-            except retriable_exceptions as exc:
-                try:
-                    countdown = min(
-                        backoff_base**self.request.retries, backoff_cap
-                    ) + random.uniform(0, 1)
-                    print(
-                        f"  retry {self.name} (attempt "
-                        f"{self.request.retries + 1}): {exc}; "
-                        f"backoff {countdown:.2f}s"
-                    )
-                    raise self.retry(
-                        exc=exc, countdown=countdown, max_retries=max_retries
-                    )
-                except MaxRetriesExceededError:
-                    print(f"  {self.name} retries exhausted: {exc}")
-                    raise exc
-
-        return wrapper
-
-    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -302,37 +216,36 @@ LOCK_CONTENTION_KEY = "fm5:notify:lock_contention_count"
 
 
 @app.task(name="fetch_document", bind=True, acks_late=True, reject_on_worker_lost=True)
-@always_returns_envelope
-@retryable(retriable_exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
-def fetch_document(self, doc_id: str) -> dict:
-    return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
+@enveloped
+@transient_retryable(exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
+def fetch_document(self, doc_id: str) -> FetchPayload:
+    return FetchPayload(doc_id=doc_id, bytes=len(doc_id) * 100)
 
 
 @app.task(name="parse_document", bind=True, acks_late=True, reject_on_worker_lost=True)
-@always_returns_envelope
-@retryable(retriable_exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
-def parse_document(self, fetched: dict) -> dict:
-    doc_id = fetched["doc_id"]
+@enveloped
+@transient_retryable(exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
+def parse_document(self, fetched: dict) -> ParsePayload:
+    fetch_result = Result.from_dict(fetched, FetchPayload)
+    doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
     # The counter increments on EVERY entry, regardless of outcome:
     # for doc1 it counts SIGKILL attempts (DLQ assertion); for doc2/3
     # it counts retryable attempts (recovery/exhaustion assertions).
-    attempts = redis_client.incr(_attempts_key(doc_id))
-    schedule = FLAKE_SCHEDULE.get(doc_id, 0)
+    attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
+    flake = FLAKE_SCHEDULE.get(doc_id, 0)
 
-    if schedule is POISON:
+    if flake is POISON:
         print(
             f"  worker pid={os.getpid()}: poison crash on {doc_id} "
             f"(attempt {attempts}/{DELIVERY_LIMIT})"
         )
         os.kill(os.getpid(), signal.SIGKILL)
 
-    if schedule is FLAKE_FOREVER or (
-        isinstance(schedule, int) and attempts <= schedule
-    ):
+    if flake is FLAKE_FOREVER or (isinstance(flake, int) and attempts <= flake):
         raise TransientServiceError(f"503 from parser-svc on {doc_id}")
 
     print(f"  worker pid={os.getpid()}: parsed {doc_id} (attempt {attempts})")
-    return {"doc_id": doc_id, "ok": True, "parsed": True, "attempts": attempts}
+    return ParsePayload(doc_id=doc_id, parsed=True, attempts=attempts)
 
 
 @app.task(
@@ -342,15 +255,13 @@ def parse_document(self, fetched: dict) -> dict:
     acks_late=True,
     reject_on_worker_lost=True,
 )
-def notify(self, results: list[dict], pipeline_id: str) -> dict:
+@enveloped
+def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
     """Send the completion email at most once per pipeline_id.
 
-    Not decorated with @retryable / @always_returns_envelope:
-      - It has its own busy-retry mechanism (self.retry on lock
-        contention) — layering @retryable would conflate the two.
-      - The chord-body contract here is {sent: True/False, ...};
-        @always_returns_envelope would return {ok: False, ...} on
-        any failure, breaking the duplicate-detection assertions.
+    Uses FM-4's busy-retry pattern. @enveloped sits outside and only
+    fires on final success or unhandled exception; self.retry() raises
+    Retry which @enveloped passes through to Celery's framework.
     """
     state_key = _notify_state_key(pipeline_id)
 
@@ -365,7 +276,15 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
         state = redis_client.get(state_key)
         if state == NOTIFY_STATE_SENT:
             print(f"  notify({pipeline_id}): already sent — skipping")
-            return _summary(results, pipeline_id, sent=False)
+            typed: list[Result[ParsePayload]] = [
+                Result.from_dict(r, ParsePayload) for r in results
+            ]
+            ok = [r for r in typed if r.status == "SUCCESS"]
+            failed = [r for r in typed if r.status == "FAILURE"]
+            return NotifyPayload(
+                final=True, pipeline_id=pipeline_id,
+                sent=False, ok=len(ok), failed=len(failed),
+            )
         redis_client.incr(LOCK_CONTENTION_KEY)
         print(
             f"  notify({pipeline_id}): lock held by another worker; "
@@ -373,11 +292,13 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
         )
         raise self.retry(countdown=NOTIFY_RETRY_DELAY_SECONDS)
 
-    # results carries a mix of envelope shapes from three paths:
-    # normal completion, retryable-exhaustion envelope, DLQ-finalized
-    # envelope. All three have an `ok` field.
-    ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
-    failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
+    # Cast header results to typed objects at the boundary.
+    # Results carry a mix of envelope shapes from three paths:
+    # normal completion, retryable-exhaustion, DLQ-finalized.
+    # All carry status="SUCCESS"|"FAILURE".
+    typed = [Result.from_dict(r, ParsePayload) for r in results]
+    ok = [r for r in typed if r.status == "SUCCESS"]
+    failed = [r for r in typed if r.status == "FAILURE"]
 
     send_email(
         f"Your pipeline documents are ready. "
@@ -391,22 +312,15 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
 
     print(f"notify: {len(ok)} ok, {len(failed)} failed")
     for r in ok:
-        print(f"  ok:     {r.get('doc_id')}")
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  ok:     {doc_id}")
     for r in failed:
-        print(f"  failed: {r.get('doc_id')}: {r.get('error')}")
-    return _summary(results, pipeline_id, sent=True)
-
-
-def _summary(results: list[dict], pipeline_id: str, sent: bool) -> dict:
-    ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
-    failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
-    return {
-        "final": True,
-        "pipeline_id": pipeline_id,
-        "sent": sent,
-        "ok": len(ok),
-        "failed": len(failed),
-    }
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  failed: {doc_id}: {r.error}")
+    return NotifyPayload(
+        final=True, pipeline_id=pipeline_id,
+        sent=True, ok=len(ok), failed=len(failed),
+    )
 
 
 @app.task(name="drain_dlq")
@@ -428,17 +342,6 @@ app.conf.beat_schedule = {
 # ---------------------------------------------------------------------------
 
 
-def _reset(doc_ids: list[str]) -> None:
-    keys = [_attempts_key(d) for d in doc_ids]
-    if keys:
-        redis_client.delete(*keys)
-
-
-def _read_attempts(doc_id: str) -> int:
-    raw = redis_client.get(_attempts_key(doc_id))
-    return int(raw) if raw else 0
-
-
 def _expected_attempts(doc_id: str) -> int:
     """How many parse_document entries we expect for a given doc.
 
@@ -446,13 +349,13 @@ def _expected_attempts(doc_id: str) -> int:
       FLAKE_FOREVER  → 1 initial + MAX_RETRIES retries
       N (int ≥ 0)    → N flakes then success = N + 1 calls
     """
-    schedule = FLAKE_SCHEDULE.get(doc_id, 0)
-    if schedule is POISON:
+    flake = FLAKE_SCHEDULE.get(doc_id, 0)
+    if flake is POISON:
         return DELIVERY_LIMIT
-    if schedule is FLAKE_FOREVER:
+    if flake is FLAKE_FOREVER:
         return MAX_RETRIES + 1
-    assert isinstance(schedule, int)
-    return schedule + 1
+    assert isinstance(flake, int)
+    return flake + 1
 
 
 def run_pipeline() -> None:
@@ -460,7 +363,7 @@ def run_pipeline() -> None:
     pipeline_id = str(uuid.uuid4())
     state_key = _notify_state_key(pipeline_id)
 
-    _reset(docs)
+    reset_attempts(redis_client, docs, ATTEMPTS_KEY_PREFIX)
     reset_send_count(redis_client, SEND_COUNT_KEY)
     reset_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     redis_client.delete(state_key)
@@ -490,8 +393,8 @@ def run_pipeline() -> None:
         message="tasks did not finish within 30s",
     )
 
-    first = chord_result.get(timeout=1)
-    second = duplicate_result.get(timeout=1)
+    first = Result.from_dict(chord_result.get(timeout=1), NotifyPayload)
+    second = Result.from_dict(duplicate_result.get(timeout=1), NotifyPayload)
     print(f"chord notify result:     {first}")
     print(f"duplicate notify result: {second}")
 
@@ -500,20 +403,24 @@ def run_pipeline() -> None:
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
 
-    doc1_attempts = _read_attempts("doc1")
+    doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
+    doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
     print("parse_document entries (from Redis):")
     for d in docs:
-        actual = _read_attempts(d)
+        actual = read_attempts(redis_client, d, ATTEMPTS_KEY_PREFIX)
         expected = _expected_attempts(d)
         print(f"  {d}: {actual} (expected {expected}, schedule={FLAKE_SCHEDULE[d]})")
 
     assert_fm1_chord_body_fired(first)
+    assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
     assert_fm4_notify_idempotent(first, second, pipeline_id, sends, contention)
     assert_fm5_retryable_result(first, expected_ok=1, expected_failed=2)
     for d in docs:
         assert_fm5_doc_attempts(
-            d, _read_attempts(d), _expected_attempts(d),
+            d,
+            read_attempts(redis_client, d, ATTEMPTS_KEY_PREFIX),
+            _expected_attempts(d),
             is_poison=(FLAKE_SCHEDULE[d] is POISON),
         )
     print(
