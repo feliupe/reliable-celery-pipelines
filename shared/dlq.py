@@ -18,14 +18,65 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from kombu import Exchange, Queue
+
 from shared.result import FetchPayload, Result
 
 if TYPE_CHECKING:
     from celery import Celery
-    from kombu import Queue
+    from kombu import Message
 
 
-def drain_dlq_messages(app: Celery, dead_letter_queue: Queue) -> None:
+def declare_dlq(app: "Celery", namespace: str, delivery_limit: int = 3) -> tuple[Queue, int]:
+    """Build DLX/DLQ/pipeline topology, configure app, and declare on the broker.
+
+    Returns (dead_letter_queue, delivery_limit) for use in drain_dlq and run_pipeline.
+    """
+    dlx_exchange = Exchange(f"{namespace}.dlx", type="direct", durable=True)
+    dlq = Queue(
+        f"{namespace}.dead_letters",
+        exchange=dlx_exchange,
+        routing_key="dead",
+        durable=True,
+        queue_arguments={"x-queue-type": "quorum"},
+    )
+    pipeline_exchange = Exchange(f"{namespace}.pipeline", type="direct", durable=True)
+    pipeline_queue = Queue(
+        f"{namespace}.pipeline",
+        exchange=pipeline_exchange,
+        routing_key="pipeline",
+        durable=True,
+        queue_arguments={
+            "x-queue-type": "quorum",
+            "x-dead-letter-exchange": f"{namespace}.dlx",
+            "x-dead-letter-routing-key": "dead",
+            "x-delivery-limit": delivery_limit,
+        },
+    )
+
+    # The DLQ is NOT a task queue — if it were, the worker would consume the
+    # poison message from the DLQ and re-enter the crash loop.
+    app.conf.task_queues = (pipeline_queue,)
+    app.conf.task_default_queue = f"{namespace}.pipeline"
+    app.conf.update(
+        task_default_exchange=f"{namespace}.pipeline",
+        task_default_routing_key="pipeline",
+    )
+    # Quorum queues don't support global (per-connection) QoS.
+    # worker_detect_quorum_queues sends basic.qos with apply_global=False.
+    app.conf.worker_detect_quorum_queues = True
+    app.conf.broker_connection_retry_on_startup = True
+    app.conf.worker_cancel_long_running_tasks_on_connection_loss = True
+
+    with app.connection_for_write() as conn:
+        with conn.channel() as ch:
+            dlx_exchange.declare(channel=ch)
+            dlq.declare(channel=ch)
+
+    return dlq, delivery_limit
+
+
+def drain_dlq_messages(app: "Celery", dead_letter_queue: Queue) -> None:
     """Pull every message currently in the DLQ and write a SUCCESS-state
     envelope to the result backend for each, advancing the chord coordinator.
     """
@@ -39,7 +90,7 @@ def drain_dlq_messages(app: Celery, dead_letter_queue: Queue) -> None:
                 _finalize_dlq_message(app, msg)
 
 
-def _finalize_dlq_message(app: Celery, msg: Any) -> None:
+def _finalize_dlq_message(app: Celery, msg: Message) -> None:
     """Extract chord context from a DLQ'd task message and write a
     SUCCESS-state failure envelope so the chord coordinator advances.
 
@@ -48,13 +99,13 @@ def _finalize_dlq_message(app: Celery, msg: Any) -> None:
       - The message body is a tuple (args, kwargs, embed), where
         embed holds {callbacks, errbacks, chain, chord}.
     RabbitMQ's DLX preserves both verbatim when dead-lettering.
+    Ref: https://docs.celeryq.dev/en/main/internals/protocol.html#task-messages
     """
     from celery.app.task import Context
 
     headers = msg.headers or {}
     task_id = headers.get("id")
     group_id = headers.get("group")
-    group_index = headers.get("group_index")
     task_name = headers.get("task")
 
     try:
@@ -73,17 +124,14 @@ def _finalize_dlq_message(app: Celery, msg: Any) -> None:
     context = Context()
     context.id = task_id
     context.group = group_id
-    context.group_index = group_index
     context.chord = app.signature(chord_sig)  # type: ignore[assignment]
     context.task = task_name  # type: ignore[attr-defined]
 
-    doc_id = _infer_doc_id_from_args(args)
-    context = FetchPayload(doc_id=doc_id, bytes=0) if doc_id else None
     envelope = Result.failure(
         "DLQ'd: x-delivery-limit exceeded",
         # attempts is None — the broker counted redeliveries, not Python retries
         attempts=None,
-        context=context,
+        payload={},
     ).to_celery_dict()
     # Embed task_id in the payload dict for downstream observability
     if envelope["payload"] is None:
@@ -95,23 +143,3 @@ def _finalize_dlq_message(app: Celery, msg: Any) -> None:
     )
     app.backend.mark_as_done(task_id, envelope, request=context)
     msg.ack()
-
-
-def _infer_doc_id_from_args(args: Any) -> str | None:
-    """Best-effort: extract doc_id from the task's positional args.
-
-    After the envelope migration, parse_document receives a serialized
-    Result[FetchPayload] dict as its first arg, so args[0] looks like
-    {"status": "SUCCESS", "payload": {"doc_id": ..., "bytes": ...}, ...}.
-    """
-    try:
-        first = args[0]
-        if not isinstance(first, dict):
-            return None
-        if "status" in first and "payload" in first:
-            payload = first.get("payload") or {}
-            return payload.get("doc_id")
-        return first.get("doc_id")
-    except (IndexError, TypeError):
-        pass
-    return None

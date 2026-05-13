@@ -8,3 +8,4 @@ venv/
 *.egg-info/
 celery_results.sqlite
 celerybeat-schedule
+.fm_run_logs

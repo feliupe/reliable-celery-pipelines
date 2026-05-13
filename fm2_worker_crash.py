@@ -1,47 +1,23 @@
 """Fix for FM-2: a worker crash mid-task no longer loses the message.
 
-Failure mode
-------------
-A worker is processing a message when the process dies hard — OOM
-kill, SIGKILL, kernel panic, container eviction. Default Celery
-behavior:
+Delta from fm1_mid_pipeline_error.py
+-------------------------------------
+- acks_late=True + reject_on_worker_lost=True on every task: the broker
+  holds the message until the task acks successfully; a SIGKILL'd child
+  causes the master to NACK/reject back to the queue for redelivery.
+- Redis attempts counter (shared.counters): tracks parse_document entries
+  across process boundaries.
+- CRASH_ONCE sentinel + its parse_document branch: doc3 SIGKILLs the
+  worker on its first attempt, succeeds on the redelivered second attempt.
 
-  acks_late=False (the default)
-      The broker is acked the moment the worker pulls the message,
-      BEFORE the task body runs. If the worker dies mid-task the
-      broker has already discarded the message; nothing redelivers.
-      The task silently never completes, and any chord/group waiting
-      on it stalls forever.
+FLAKE_SCHEDULE grows by one entry ("doc3": CRASH_ONCE). docs grows by
+one element ("doc3").
 
-Fix
----
-Two task-level settings, both required:
-
-  acks_late=True
-      Defer the ack until the task returns successfully. If the
-      worker dies mid-task the broker still holds the message.
-
-  reject_on_worker_lost=True
-      When Celery's master detects a child died mid-task it would by
-      default ack the message anyway (and record a WorkerLostError
-      result). With this flag the master REJECTS the message back to
-      the queue so a respawned or sibling worker can retry it.
-
-Both together: child dies → broker requeues → respawned/sibling worker
-picks it up → task body runs again → chord completes.
-
-Demo: parse_document SIGKILLs its own child on doc1's first attempt.
-SIGKILL is uncatchable — bypasses Python finally blocks and Celery
-shutdown hooks; same signature as OOM-killer / container eviction. A
-counter in Redis tracks attempts across the crash; the run asserts
-doc1 ran twice (crash + redelivery) and the chord still completed.
-
-Caveats (companion fixes)
--------------------------
-Redelivery means the task body executes more than once. Non-idempotent
-side effects (email, charge, external write) fire twice. → FM-4.
-Redelivery is unbounded; a poison message that always crashes the
-worker loops forever. → FM-3.
+Caveats (addressed in later FMs)
+---------------------------------
+Redelivery means the task body executes more than once — non-idempotent
+side effects fire twice (→ FM-4).
+Redelivery is unbounded for a message that always crashes (→ FM-3).
 
 Run
 ---
@@ -49,9 +25,9 @@ Run
   celery -A fm2_worker_crash worker --loglevel=info --concurrency=2
   python fm2_worker_crash.py
 
-Concurrency must be >= 2: a sibling worker absorbs the redelivered
-message immediately rather than waiting for the master to respawn the
-killed child. Both work; >= 2 is faster and timing-stable.
+--concurrency=2 required: a sibling worker absorbs the redelivered
+message immediately rather than waiting for the master to respawn
+the killed child.
 """
 
 from __future__ import annotations
@@ -60,17 +36,19 @@ import os
 import signal
 import uuid
 
-import redis
 from celery import Celery, chord
 
+from shared import redis
 from shared.counters import incr_attempts, read_attempts, reset_attempts
+from shared.redis import REDIS_URL
 from shared.decorators import enveloped
-from shared.fm_asserts import assert_fm1_chord_body_fired, assert_fm2_redelivery_happened
+from shared.flake import CRASH_ONCE, FAIL, FlakeEntry
+from shared.fm_asserts import (
+    assert_fm1_chord_body_fired,
+    assert_fm2_redelivery_happened,
+)
 from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
-
-REDIS_URL = "redis://localhost:6379/0"
-ATTEMPTS_KEY_PREFIX = "fm2:crash_attempts"
 
 app = Celery(
     "fm2_worker_crash",
@@ -78,17 +56,26 @@ app = Celery(
     backend=REDIS_URL,
 )
 
-# Cross-process attempt counter. self.request.retries doesn't help —
-# that tracks self.retry() calls, not broker redeliveries from a
-# crashed worker. We need state that survives a SIGKILL'd child.
-redis_client = redis.Redis.from_url(REDIS_URL)
+# ---------------------------------------------------------------------------
+# Per-doc behavior schedule
+# ---------------------------------------------------------------------------
+
+FLAKE_SCHEDULE: dict[str, FlakeEntry] = {
+    "doc1": FAIL,  # FM-0: raises RuntimeError → FAILURE envelope (FM-1 proven)
+    "doc3": CRASH_ONCE,  # FM-2: SIGKILL on attempt 1; broker redelivers; succeeds attempt 2
+}
 
 
-# Pipeline-wide settings. acks_late + reject_on_worker_lost is applied
-# uniformly to every task in the chain — in production you don't want
-# any step to silently swallow a crashed message. The demo only
-# exercises the flags on parse_document (it's the one that crashes),
-# but the uniform application matches realistic config.
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+
+
+# FM-2: acks_late defers the broker ack until the task returns successfully.
+# reject_on_worker_lost tells the master to NACK (not ack) when a child dies
+# mid-task, so the broker requeues instead of discarding the message.
+# Applied uniformly: in production you don't want any step to silently lose
+# a crashed message.
 @app.task(name="fetch_document", bind=True, acks_late=True, reject_on_worker_lost=True)
 @enveloped
 def fetch_document(self, doc_id: str) -> FetchPayload:
@@ -100,12 +87,17 @@ def fetch_document(self, doc_id: str) -> FetchPayload:
 def parse_document(self, fetched: dict) -> ParsePayload:
     fetch_result = Result.from_dict(fetched, FetchPayload)
     doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
-    attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
+    attempts = incr_attempts(doc_id)
+    flake = FLAKE_SCHEDULE.get(doc_id)
 
-    # Crash injection: doc1's first execution dies hard mid-task.
-    # SIGKILL is uncatchable — bypasses Python cleanup and Celery
-    # shutdown. From the master's POV the child just disappeared.
-    if doc_id == "doc1" and attempts == 1:
+    # FM-0+: @enveloped catches this RuntimeError → FAILURE envelope
+    if flake is FAIL:
+        raise RuntimeError(f"parser crashed on {doc_id}")
+
+    # FM-2+: SIGKILL on attempt 1. SIGKILL is uncatchable — bypasses Python
+    # cleanup and Celery hooks. acks_late + reject_on_worker_lost requeue
+    # the message; the sibling worker picks it up and succeeds on attempt 2.
+    if flake is CRASH_ONCE and attempts == 1:
         print(f"  worker pid={os.getpid()}: crashing on {doc_id} (attempt 1)")
         os.kill(os.getpid(), signal.SIGKILL)
 
@@ -137,17 +129,21 @@ def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
     )
 
 
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+
 def run_pipeline() -> None:
-    docs = ["doc1", "doc2"]
+    docs = ["doc1", "doc2", "doc3"]
     pipeline_id = str(uuid.uuid4())
-    reset_attempts(redis_client, docs, ATTEMPTS_KEY_PREFIX)
+    redis.client.flushall()
 
     header = [fetch_document.s(d) | parse_document.s() for d in docs]
     pipeline = chord(header, body=notify.s(pipeline_id=pipeline_id))
     result = pipeline.apply_async()
 
-    # Worst case: crash detection (~few s) + respawn or sibling
-    # pickup + parse. 30s is comfortable.
+    # Worst case: crash detection + sibling pickup + parse. 30s is comfortable.
     wait_until(
         result.ready,
         timeout=30,
@@ -162,17 +158,15 @@ def run_pipeline() -> None:
     print(f"pipeline result: {raw}")
     notify_result = Result.from_dict(raw, NotifyPayload)
 
-    doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
-    doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
-    print("parse attempts (from Redis):")
-    print(f"  doc1: {doc1_attempts} (expected 2 — crash + redelivery)")
+    doc3_attempts = read_attempts("doc3")
+    doc2_attempts = read_attempts("doc2")
+    print("parse_document entries (from Redis):")
+    print(f"  doc1: {read_attempts('doc1')} (expected 1, raises immediately)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
+    print(f"  doc3: {doc3_attempts} (expected 2 — crash + redelivery)")
 
     assert assert_fm1_chord_body_fired(notify_result)
-    assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
-    assert doc1_attempts == 2, (
-        f"FM-2: doc1 should have run exactly twice; got {doc1_attempts}"
-    )
+    assert_fm2_redelivery_happened(doc3_attempts, doc2_attempts)
     print("FM-2 fixed: SIGKILL'd parse_document was redelivered and completed.")
 
 

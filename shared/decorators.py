@@ -44,7 +44,6 @@ from celery.exceptions import MaxRetriesExceededError, Retry
 
 from shared.result import FetchPayload, Result
 
-
 # ---------------------------------------------------------------------------
 # @enveloped
 # ---------------------------------------------------------------------------
@@ -55,12 +54,6 @@ def enveloped(func: Callable[..., Any]) -> Callable[..., Any]:
 
     Success path → Result.success(payload, attempts).to_celery_dict()
     Failure path → Result.failure(str(exc), attempts, context).to_celery_dict()
-
-    Failure context is extracted best-effort from args[0]: if the first
-    positional arg is a serialised Result[FetchPayload] dict (i.e., it has
-    "status" and "payload" keys), unpack its payload as a FetchPayload so
-    the failure envelope carries doc_id for observability. Otherwise context
-    is None.
 
     Retry signal is NEVER caught — it must propagate to Celery's framework.
     """
@@ -74,34 +67,11 @@ def enveloped(func: Callable[..., Any]) -> Callable[..., Any]:
         except Retry:
             raise
         except Exception as exc:
-            context = _extract_context(args)
             return Result.failure(
-                str(exc), attempts=attempts, context=context
+                str(exc), attempts=attempts, payload={}
             ).to_celery_dict()
 
     return wrapper
-
-
-def _extract_context(args: tuple[Any, ...]) -> FetchPayload | None:
-    """Best-effort: pull FetchPayload from the first positional arg.
-
-    parse_document receives the output of fetch_document as its first arg.
-    After the envelope migration, that is a Result[FetchPayload] dict with
-    keys "status" and "payload". Unpack the payload so the FAILURE envelope
-    carries doc_id.
-    """
-    if not args:
-        return None
-    first = args[0]
-    if not isinstance(first, dict):
-        return None
-    if "status" in first and "payload" in first:
-        raw = first.get("payload") or {}
-        try:
-            return FetchPayload(**raw)
-        except (TypeError, KeyError):
-            return None
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +101,9 @@ def transient_retryable(
                 return func(self, *args, **kwargs)
             except exceptions as exc:
                 try:
-                    countdown = (
-                        min(backoff_base ** self.request.retries, backoff_cap)
-                        + random.uniform(0, 1)
-                    )
+                    countdown = min(
+                        backoff_base**self.request.retries, backoff_cap
+                    ) + random.uniform(0, 1)
                     print(
                         f"  retry {self.name} (attempt "
                         f"{self.request.retries + 1}): {exc}; "

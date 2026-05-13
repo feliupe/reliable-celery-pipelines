@@ -1,49 +1,20 @@
-"""Fix for FM-5: intermittent failures from external services no
-longer kill the doc.
+"""Fix for FM-5: intermittent failures from external services no longer kill the doc.
 
-Layered on fm4_duplicated_runs.py (FM-4); the DLQ reconciliation,
-idempotent notify, and acks_late survivability are inherited
-verbatim. Read those files first.
+Delta from fm4_duplicated_runs.py
+-----------------------------------
+- @transient_retryable stacked between @enveloped and the body on
+  fetch_document and parse_document: catches TransientServiceError and
+  schedules an exponential-backoff retry; on exhaustion re-raises so
+  @enveloped converts it to a FAILURE envelope.
+- TransientServiceError class defined (stand-in for 503/connection-reset).
+- FLAKE_FOREVER sentinel + handling added to parse_document body.
+- FLAKE_SCHEDULE adds doc5 (flake 2x → succeeds) and doc6 (flake forever).
 
-Technique: bounded retries with exponential backoff + jitter,
-implemented as two shared decorators from shared/decorators.py:
 
-    @app.task(name=..., bind=True, acks_late=True, ...)
-    @enveloped                # converts escapes to Result(status="FAILURE")
-    @transient_retryable(...) # catches transients, schedules retry
-    def task(self, ...):
-        ...
-
-Order matters. Swap envelope and retryable and you'll either eat
-Celery's Retry signal (no retries) or break FM-1 again (chord dies
-on terminal failure). bind=True is mandatory — both decorators read
-self.request / call self.retry.
-
-How this composes with FM-3 and FM-4
-------------------------------------
-Three distinct failure-handling paths now coexist, keyed by how
-the body exits:
-
-  - SIGKILL (no Python exception)     → no ack → broker redelivery →
-    x-delivery-count increments → DLQ at limit → drain_dlq finalizes
-    a Result(status="FAILURE") chord-member envelope (FM-3 path).
-
-  - raise TransientServiceError       → @transient_retryable catches →
-    self.retry ACKs the original and schedules a new delivery → fresh
-    x-delivery-count. Transient retries DO NOT accumulate toward DLQ.
-
-  - raise TransientServiceError (exhausted) → @transient_retryable
-    re-raises → @enveloped returns Result(status="FAILURE") → chord
-    member completes SUCCESS Celery state with a typed FAILURE payload
-    (same shape drain_dlq writes).
-
-All three converge into notify, which aggregates by result.status.
-
-Per-doc scenario (deterministic for reproducible asserts)
----------------------------------------------------------
-  doc1  poison → SIGKILL every time → DLQ path           (FM-3)
-  doc2  transient flake 2x, succeeds on attempt 3        (FM-5 recovery)
-  doc3  transient flake forever, retries exhaust         (FM-5 envelope)
+Order matters: @transient_retryable re-raises on exhaustion; @enveloped
+(outer) catches that and returns a FAILURE envelope. Swapping them would
+either eat the Retry signal (no retries) or break FM-1 (chord dies on
+terminal failure).
 
 Run
 ---
@@ -58,13 +29,21 @@ import os
 import signal
 import uuid
 
-import redis
 from celery import Celery, chord
 from celery.schedules import schedule
-from kombu import Exchange, Queue
-
 from shared.counters import incr_attempts, read_attempts, reset_attempts
-from shared.decorators import enveloped, transient_retryable
+from shared.decorators import (
+    enveloped,
+    transient_retryable,
+)  # FM-5: bounded retries on transient errors
+from shared.dlq import declare_dlq, drain_dlq_messages
+from shared.flake import (
+    CRASH_ONCE,
+    FAIL,
+    FLAKE_FOREVER,
+    POISON,
+    FlakeEntry,
+)  # FM-5: FLAKE_FOREVER
 from shared.fm_asserts import (
     assert_fm1_chord_body_fired,
     assert_fm2_redelivery_happened,
@@ -74,6 +53,8 @@ from shared.fm_asserts import (
     assert_fm5_retryable_result,
 )
 from shared.idempotency import (
+    ClaimResult,
+    NotifyCoordinator,
     read_lock_contention_count,
     read_send_count,
     reset_lock_contention_count,
@@ -83,8 +64,7 @@ from shared.idempotency import (
 from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
 
-REDIS_URL = "redis://localhost:6379/0"
-ATTEMPTS_KEY_PREFIX = "fm5:attempts"
+from shared.redis import REDIS_URL, client as redis_client
 
 app = Celery(
     "fm5_transient_failures",
@@ -94,119 +74,42 @@ app = Celery(
 
 
 # ---------------------------------------------------------------------------
-# Broker topology — see fm3_dlq_reconciliation.py. Renamed fm4.* → fm5.*
-# so this file's queues coexist with prior FMs without redeclare
-# collisions.
+# FM-3: broker topology (renamed fm4.* → fm5.*)
 # ---------------------------------------------------------------------------
 
-DLX_NAME = "fm5.dlx"
-DLQ_NAME = "fm5.dead_letters"
-PIPELINE_QUEUE = "fm5.pipeline"
-DELIVERY_LIMIT = 3
+dead_letter_queue, DELIVERY_LIMIT = declare_dlq(app, "fm5")
 
-dlx_exchange = Exchange(DLX_NAME, type="direct", durable=True)
-dead_letter_queue = Queue(
-    DLQ_NAME,
-    exchange=dlx_exchange,
-    routing_key="dead",
-    durable=True,
-    queue_arguments={"x-queue-type": "quorum"},
-)
-
-pipeline_exchange = Exchange("fm5.pipeline", type="direct", durable=True)
-pipeline_queue = Queue(
-    PIPELINE_QUEUE,
-    exchange=pipeline_exchange,
-    routing_key="pipeline",
-    durable=True,
-    queue_arguments={
-        "x-queue-type": "quorum",
-        "x-dead-letter-exchange": DLX_NAME,
-        "x-dead-letter-routing-key": "dead",
-        "x-delivery-limit": DELIVERY_LIMIT,
-    },
-)
-
-app.conf.task_queues = (pipeline_queue,)
-app.conf.task_default_queue = PIPELINE_QUEUE
-app.conf.update(task_default_exchange="fm5.pipeline", task_default_routing_key="pipeline")
-
-
-def _declare_dlq_topology() -> None:
-    with app.connection_for_write() as conn:
-        with conn.channel() as ch:
-            dlx_exchange.declare(channel=ch)
-            dead_letter_queue.declare(channel=ch)
-
-
-_declare_dlq_topology()
-
-app.conf.worker_detect_quorum_queues = True
-app.conf.broker_connection_retry_on_startup = True
-app.conf.worker_cancel_long_running_tasks_on_connection_loss = True
-
-
-redis_client = redis.Redis.from_url(REDIS_URL)
-DRAIN_INTERVAL_SECONDS = 5
-MAX_RETRIES = 3
+DRAIN_INTERVAL_SECONDS = 5  # FM-3: DLQ drain cadence
+MAX_RETRIES = 3  # FM-5: @transient_retryable retry budget
 
 
 # ---------------------------------------------------------------------------
-# Transient error type
+# FM-4: idempotency machinery
+# ---------------------------------------------------------------------------
+
+NOTIFY_RETRY_DELAY_SECONDS = 10
+
+
+# ---------------------------------------------------------------------------
+# FM-5: transient error type
 # ---------------------------------------------------------------------------
 
 
 class TransientServiceError(Exception):
-    """Stand-in for 503 / connection-reset / read-timeout from an external
-    service. In real code these are mapped from the HTTP client."""
+    """Stand-in for 503 / connection-reset / read-timeout from an external service."""
 
 
 # ---------------------------------------------------------------------------
-# Per-doc behavior schedule (demo-only)
+# Per-doc behavior schedule
 # ---------------------------------------------------------------------------
 
-
-class _Sentinel:
-    """Identity-based marker for FLAKE_SCHEDULE entries. Using a small
-    class (rather than mixing strings and -1) lets every schedule value
-    be either a sentinel or an int count, with no ambiguous overlap."""
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-    def __repr__(self) -> str:
-        return f"<{self.name}>"
-
-
-POISON = _Sentinel("POISON")  # SIGKILL the worker every call → DLQ path
-FLAKE_FOREVER = _Sentinel("FLAKE_FOREVER")  # always raise TransientServiceError → exhaust retries
-
-
-# doc_id → either POISON, FLAKE_FOREVER, or an integer N meaning
-# "raise transient N times then succeed".
-FLAKE_SCHEDULE: dict[str, _Sentinel | int] = {
-    "doc1": POISON,
-    "doc2": 2,
-    "doc3": FLAKE_FOREVER,
+FLAKE_SCHEDULE: dict[str, FlakeEntry] = {
+    "doc1": FAIL,  # FM-0: raises RuntimeError → FAILURE envelope (FM-1 proven)
+    "doc3": CRASH_ONCE,  # FM-2: SIGKILL on attempt 1; broker redelivers; succeeds attempt 2
+    "doc4": POISON,  # FM-3: permanent SIGKILL → x-delivery-limit → DLQ → drain_dlq finalizes
+    "doc5": 2,  # FM-5: TransientServiceError 2x, then success on attempt 3
+    "doc6": FLAKE_FOREVER,  # FM-5: TransientServiceError always → retries exhausted → FAILURE envelope
 }
-
-
-# ---------------------------------------------------------------------------
-# Idempotency machinery (FM-4)
-# ---------------------------------------------------------------------------
-
-NOTIFY_STATE_NOT_SENT = b"0"
-NOTIFY_STATE_SENT = b"1"
-NOTIFY_LOCK_TTL_SECONDS = 600
-NOTIFY_RETRY_DELAY_SECONDS = 10
-
-
-def _notify_state_key(pipeline_id: str) -> str:
-    return f"fm5:notify:state:{pipeline_id}"
-
-
-SEND_COUNT_KEY = "fm5:send_email:count"
-LOCK_CONTENTION_KEY = "fm5:notify:lock_contention_count"
 
 
 # ---------------------------------------------------------------------------
@@ -216,23 +119,36 @@ LOCK_CONTENTION_KEY = "fm5:notify:lock_contention_count"
 
 @app.task(name="fetch_document", bind=True, acks_late=True, reject_on_worker_lost=True)
 @enveloped
-@transient_retryable(exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
+@transient_retryable(
+    exceptions=(TransientServiceError,), max_retries=MAX_RETRIES
+)  # FM-5: bounded retries
 def fetch_document(self, doc_id: str) -> FetchPayload:
     return FetchPayload(doc_id=doc_id, bytes=len(doc_id) * 100)
 
 
 @app.task(name="parse_document", bind=True, acks_late=True, reject_on_worker_lost=True)
 @enveloped
-@transient_retryable(exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
+@transient_retryable(
+    exceptions=(TransientServiceError,), max_retries=MAX_RETRIES
+)  # FM-5: bounded retries
 def parse_document(self, fetched: dict) -> ParsePayload:
     fetch_result = Result.from_dict(fetched, FetchPayload)
     doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
-    # The counter increments on EVERY entry, regardless of outcome:
-    # for doc1 it counts SIGKILL attempts (DLQ assertion); for doc2/3
-    # it counts retryable attempts (recovery/exhaustion assertions).
-    attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
-    flake = FLAKE_SCHEDULE.get(doc_id, 0)
+    # Counter increments on EVERY entry: for CRASH_ONCE/POISON it counts broker
+    # redeliveries; for FLAKE/int it counts self.retry() calls.
+    attempts = incr_attempts(doc_id)
+    flake = FLAKE_SCHEDULE.get(doc_id)
 
+    # FM-0+: @enveloped catches this RuntimeError → FAILURE envelope
+    if flake is FAIL:
+        raise RuntimeError(f"parser crashed on {doc_id}")
+
+    # FM-2+: SIGKILL on attempt 1; redelivered and succeeds on attempt 2
+    if flake is CRASH_ONCE and attempts == 1:
+        print(f"  worker pid={os.getpid()}: crashing on {doc_id} (attempt 1)")
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    # FM-3+: permanent SIGKILL; x-delivery-limit caps the loop; drain_dlq finalizes
     if flake is POISON:
         print(
             f"  worker pid={os.getpid()}: poison crash on {doc_id} "
@@ -240,6 +156,9 @@ def parse_document(self, fetched: dict) -> ParsePayload:
         )
         os.kill(os.getpid(), signal.SIGKILL)
 
+    # FM-5+: raise TransientServiceError N times then succeed (int N), or always (FLAKE_FOREVER).
+    # @transient_retryable catches this, schedules a self.retry() with backoff.
+    # On exhaustion it re-raises → @enveloped converts to FAILURE envelope.
     if flake is FLAKE_FOREVER or (isinstance(flake, int) and attempts <= flake):
         raise TransientServiceError(f"503 from parser-svc on {doc_id}")
 
@@ -250,64 +169,45 @@ def parse_document(self, fetched: dict) -> ParsePayload:
 @app.task(
     name="notify",
     bind=True,
-    max_retries=5,
+    max_retries=5,  # FM-4: busy-retry budget for the lock-held branch
     acks_late=True,
     reject_on_worker_lost=True,
 )
 @enveloped
 def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
-    """Send the completion email at most once per pipeline_id.
-
-    Uses FM-4's busy-retry pattern. @enveloped sits outside and only
-    fires on final success or unhandled exception; self.retry() raises
-    Retry which @enveloped passes through to Celery's framework.
-    """
-    state_key = _notify_state_key(pipeline_id)
-
-    claimed = redis_client.set(
-        state_key,
-        NOTIFY_STATE_NOT_SENT,
-        nx=True,
-        ex=NOTIFY_LOCK_TTL_SECONDS,
-    )
-
-    if not claimed:
-        state = redis_client.get(state_key)
-        if state == NOTIFY_STATE_SENT:
-            print(f"  notify({pipeline_id}): already sent — skipping")
-            typed: list[Result[ParsePayload]] = [
-                Result.from_dict(r, ParsePayload) for r in results
-            ]
-            ok = [r for r in typed if r.status == "SUCCESS"]
-            failed = [r for r in typed if r.status == "FAILURE"]
-            return NotifyPayload(
-                final=True, pipeline_id=pipeline_id,
-                sent=False, ok=len(ok), failed=len(failed),
-            )
-        redis_client.incr(LOCK_CONTENTION_KEY)
-        print(
-            f"  notify({pipeline_id}): lock held by another worker; "
-            f"retrying in {NOTIFY_RETRY_DELAY_SECONDS}s"
-        )
-        raise self.retry(countdown=NOTIFY_RETRY_DELAY_SECONDS)
-
-    # Cast header results to typed objects at the boundary.
-    # Results carry a mix of envelope shapes from three paths:
-    # normal completion, retryable-exhaustion, DLQ-finalized.
-    # All carry status="SUCCESS"|"FAILURE".
-    typed = [Result.from_dict(r, ParsePayload) for r in results]
+    """FM-4: idempotency lock. @enveloped passes through self.retry() Retry signal."""
+    coordinator = NotifyCoordinator(pipeline_id)
+    typed: list[Result[ParsePayload]] = [
+        Result.from_dict(r, ParsePayload) for r in results
+    ]
     ok = [r for r in typed if r.status == "SUCCESS"]
     failed = [r for r in typed if r.status == "FAILURE"]
+
+    match coordinator.try_claim():
+        case ClaimResult.ALREADY_SENT:
+            print(f"  notify({pipeline_id}): already sent — skipping")
+            return NotifyPayload(
+                final=True,
+                pipeline_id=pipeline_id,
+                sent=False,
+                ok=len(ok),
+                failed=len(failed),
+            )
+        case ClaimResult.CONTENDED:
+            print(
+                f"  notify({pipeline_id}): lock held by another worker; retrying in {NOTIFY_RETRY_DELAY_SECONDS}s"
+            )
+            raise self.retry(countdown=NOTIFY_RETRY_DELAY_SECONDS)
+        case ClaimResult.CLAIMED:
+            pass
 
     send_email(
         f"Your pipeline documents are ready. "
         f"Id: {pipeline_id}. "
         f"Processed: {len(ok)}. "
         f"Failed: {len(failed)}.",
-        redis_client,
-        SEND_COUNT_KEY,
     )
-    redis_client.set(state_key, NOTIFY_STATE_SENT)
+    coordinator.mark_sent()
 
     print(f"notify: {len(ok)} ok, {len(failed)} failed")
     for r in ok:
@@ -317,14 +217,17 @@ def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
         doc_id = r.payload.doc_id if r.payload else "?"
         print(f"  failed: {doc_id}: {r.error}")
     return NotifyPayload(
-        final=True, pipeline_id=pipeline_id,
-        sent=True, ok=len(ok), failed=len(failed),
+        final=True,
+        pipeline_id=pipeline_id,
+        sent=True,
+        ok=len(ok),
+        failed=len(failed),
     )
 
 
 @app.task(name="drain_dlq")
 def drain_dlq() -> None:
-    from shared.dlq import drain_dlq_messages
+    """FM-3: beat task — reads DLQ, writes SUCCESS-state envelopes, advances chord."""
     drain_dlq_messages(app, dead_letter_queue)
 
 
@@ -337,47 +240,53 @@ app.conf.beat_schedule = {
 
 
 # ---------------------------------------------------------------------------
-# Driver
+# Runner
 # ---------------------------------------------------------------------------
 
 
 def _expected_attempts(doc_id: str) -> int:
-    """How many parse_document entries we expect for a given doc.
+    """Predicted parse_document entry count per doc.
 
-      POISON         → DELIVERY_LIMIT crashes (broker cap)
-      FLAKE_FOREVER  → 1 initial + MAX_RETRIES retries
-      N (int ≥ 0)    → N flakes then success = N + 1 calls
+    FAIL         → 1  (raises immediately; no retry for RuntimeError)
+    CRASH_ONCE   → 2  (crash + redelivery)
+    POISON       → DELIVERY_LIMIT  (broker cap)
+    FLAKE_FOREVER → 1 + MAX_RETRIES
+    N (int ≥ 0)  → N + 1  (N flakes then success)
     """
-    flake = FLAKE_SCHEDULE.get(doc_id, 0)
+    flake = FLAKE_SCHEDULE.get(doc_id)
     if flake is POISON:
         return DELIVERY_LIMIT
     if flake is FLAKE_FOREVER:
         return MAX_RETRIES + 1
-    assert isinstance(flake, int)
-    return flake + 1
+    if flake is CRASH_ONCE:
+        return 2
+    if flake is FAIL:
+        return 1
+    if isinstance(flake, int):
+        return flake + 1
+    return 1  # happy path (no entry)
 
 
 def run_pipeline() -> None:
-    docs = ["doc1", "doc2", "doc3"]
+    docs = ["doc1", "doc2", "doc3", "doc4", "doc5", "doc6"]
     pipeline_id = str(uuid.uuid4())
-    state_key = _notify_state_key(pipeline_id)
+    coordinator = NotifyCoordinator(pipeline_id)
 
-    reset_attempts(redis_client, docs, ATTEMPTS_KEY_PREFIX)
-    reset_send_count(redis_client, SEND_COUNT_KEY)
-    reset_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
-    redis_client.delete(state_key)
+    reset_attempts(docs)
+    reset_send_count()
+    reset_lock_contention_count()
+    redis_client.flushall()
 
     header = [fetch_document.s(d) | parse_document.s() for d in docs]
     pipeline = chord(header, body=notify.s(pipeline_id=pipeline_id))
     chord_result = pipeline.apply_async()
     print(f"chord submitted: id={chord_result.id} pipeline_id={pipeline_id}")
 
-    # Lock-claim budget: max of (poison DLQ path ≈ 15-20s, retryable
-    # exhaustion ≈ 1+2+4 backoff = ~7-10s, retryable recovery ≈ 3-5s).
-    # All in parallel for headers, so ≈ 20s. 90s is comfortable.
+    # Budget: max of (poison DLQ path ≈15-20s, retryable exhaustion ≈7-10s).
+    # All headers run in parallel. 90s comfortable.
     print("waiting for chord notify to claim the lock...")
     wait_until(
-        lambda: bool(redis_client.exists(state_key)),
+        lambda: coordinator.is_claimed(),
         timeout=90,
         message="chord notify never claimed the lock within 90s",
     )
@@ -397,34 +306,40 @@ def run_pipeline() -> None:
     print(f"chord notify result:     {first}")
     print(f"duplicate notify result: {second}")
 
-    sends = read_send_count(redis_client, SEND_COUNT_KEY)
-    contention = read_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
+    sends = read_send_count()
+    contention = read_lock_contention_count()
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
 
-    doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
-    doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
     print("parse_document entries (from Redis):")
     for d in docs:
-        actual = read_attempts(redis_client, d, ATTEMPTS_KEY_PREFIX)
+        actual = read_attempts(d)
         expected = _expected_attempts(d)
-        print(f"  {d}: {actual} (expected {expected}, schedule={FLAKE_SCHEDULE[d]})")
+        print(
+            f"  {d}: {actual} (expected {expected}, schedule={FLAKE_SCHEDULE.get(d, 'happy')})"
+        )
+
+    doc3_attempts = read_attempts("doc3")
+    doc4_attempts = read_attempts("doc4")
+    doc2_attempts = read_attempts("doc2")
 
     assert assert_fm1_chord_body_fired(first)
-    assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
-    assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
+    assert_fm2_redelivery_happened(doc3_attempts, doc2_attempts)
+    assert_fm3_poison_bounded_at_dlq(doc4_attempts, delivery_limit=DELIVERY_LIMIT)
     assert_fm4_notify_idempotent(first, second, pipeline_id, sends, contention)
-    assert_fm5_retryable_result(first, expected_ok=1, expected_failed=2)
+    # ok: doc2 (happy) + doc3 (CRASH_ONCE recovers) + doc5 (flake 2x recovers) = 3
+    # failed: doc1 (FAIL) + doc4 (POISON→DLQ) + doc6 (FLAKE_FOREVER exhausted) = 3
+    assert_fm5_retryable_result(first, expected_ok=3, expected_failed=3)
     for d in docs:
         assert_fm5_doc_attempts(
             d,
-            read_attempts(redis_client, d, ATTEMPTS_KEY_PREFIX),
+            read_attempts(d),
             _expected_attempts(d),
-            is_poison=(FLAKE_SCHEDULE[d] is POISON),
+            is_poison=(FLAKE_SCHEDULE.get(d) is POISON),
         )
     print(
-        f"FM-5 fixed: doc2 recovered via retryable; "
-        f"doc3 exhausted retries → envelope; doc1 → DLQ; "
+        f"FM-5 fixed: doc5 recovered via retryable; "
+        f"doc6 exhausted retries → envelope; doc4 → DLQ; "
         f"send_email idempotent (1 send across 2 notifies)."
     )
 

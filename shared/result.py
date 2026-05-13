@@ -1,7 +1,7 @@
 """Typed result envelope for all pipeline tasks.
 
 Every task decorated with @enveloped returns a serialized Result[T] dict.
-At the boundary (notify body, run_pipeline driver), reconstruct typed objects
+At the boundary (notify body, run_pipeline runner), reconstruct typed objects
 with Result.from_dict(raw, PayloadType).
 
 Celery uses JSON serialization by default — dataclasses are not directly
@@ -49,9 +49,9 @@ class Result(Generic[T]):
         error: str,
         *,
         attempts: int | None,
-        context: T | None = None,
+        payload: T | None = None,
     ) -> "Result[T]":
-        return cls(status="FAILURE", payload=context, error=error, attempts=attempts)
+        return cls(status="FAILURE", payload=payload, error=error, attempts=attempts)
 
     # ------------------------------------------------------------------
     # Celery serialization
@@ -98,9 +98,11 @@ class Result(Generic[T]):
 
 
 if TYPE_CHECKING:
+
     @dataclass
     class SuccessResult(Result[T]):  # type: ignore[misc]
         """Result[T] narrowed to SUCCESS: payload is guaranteed non-None."""
+
         payload: T  # type: ignore[assignment]
 
 

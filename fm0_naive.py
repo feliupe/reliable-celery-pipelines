@@ -1,27 +1,33 @@
-"""Naive baseline demonstrating FM-1: pipeline dies mid-way on partial failure.
+"""Naive baseline — demonstrates FM-1: the chord callback never fires on
+partial header failure.
 
+No fixes applied here. parse_document raises unconditionally for doc1
+(FLAKE_SCHEDULE["doc1"] = FAIL). Celery propagates the exception as a
+FAILURE-state chord member; the chord coordinator never dispatches the
+body; the pipeline stalls forever.
 
-Run instructions
-----------------
-  # 1. start the broker
+The FLAKE_SCHEDULE dispatch shape is introduced here so every later FM
+can copy-paste this file and merely add new sentinels and new behavior
+branches — no structural rewrites needed.
+
+Run
+---
   docker-compose up -d
-
-  # 2. start a worker (in one terminal)
   celery -A fm0_naive worker --loglevel=info
-
-  # 3. run the script (in another terminal)
-  python fm0_naive.py                 # failure case: FM-1 is demonstrated
-  FAIL_PARSE=0 python fm0_naive.py    # happy path: proves the wiring works
-
+  python fm0_naive.py     # doc1 fails, chord stalls — FM-1 on display
 """
 
 from __future__ import annotations
 
-import os
 import time
 
 from celery import Celery, chord
 from celery.exceptions import ChordError
+
+from shared.flake import (
+    FAIL,
+    FlakeEntry,
+)  # FM-0: deterministic RuntimeError to demonstrate FM-1
 
 app = Celery(
     "fm0_naive",
@@ -29,26 +35,40 @@ app = Celery(
     backend="redis://localhost:6379/0",
 )
 
+# ---------------------------------------------------------------------------
+# Per-doc behavior schedule
+# ---------------------------------------------------------------------------
+
+# Each entry maps doc_id → FlakeEntry (a sentinel or int). parse_document
+# reads this table and dispatches accordingly. Later FMs add new entries and
+# new branches; existing entries never change.
+FLAKE_SCHEDULE: dict[str, FlakeEntry] = {
+    "doc1": FAIL,  # FM-0: raises RuntimeError — the bug FM-1 fixes
+}
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+
 
 # Explicit task names so the client (running as __main__) and the worker
-# (running with `-A fm0_naive`) agree on the task registry keys. Without
-# `name=`, Celery auto-derives task names from the app's main module —
-# which can be `__main__` for the client vs the module name for the
-# worker. Explicit names sidestep the mismatch entirely.
+# (running with `-A fm0_naive`) agree on the task registry keys.
 @app.task(name="fetch_document")
 def fetch_document(doc_id: str) -> dict:
     return {"doc_id": doc_id, "bytes": len(doc_id) * 100}
 
 
-# parse_document raises unconditionally when FAIL_PARSE=1 (the default).
-# Deterministic failure — not random — so the demo is reproducible. The
-# raised exception propagates: no try/except, no retry, no errback. That
-# is the whole point of FM-1.
 @app.task(name="parse_document")
 def parse_document(fetched: dict) -> dict:
     doc_id = fetched["doc_id"]
+    flake = FLAKE_SCHEDULE.get(doc_id)
 
-    raise RuntimeError(f"parser crashed on {doc_id}")
+    # FM-0+: doc1 always raises — no @enveloped to catch it, so Celery
+    # records a FAILURE-state result and the chord coordinator stalls.
+    if flake is FAIL:
+        raise RuntimeError(f"parser crashed on {doc_id}")
+
     return {"doc_id": doc_id, "parsed": True}
 
 
@@ -56,6 +76,11 @@ def parse_document(fetched: dict) -> dict:
 def notify(results: list[dict]) -> dict:
     print(f"notify aggregated: {results}")
     return {"final": True, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
 
 
 def run_pipeline() -> None:
@@ -71,23 +96,27 @@ def run_pipeline() -> None:
 
     deadline = time.time() + 10
     while time.time() < deadline:
-        print("Not ready.")
         if result.ready():
-            print("Ready.")
             break
+        print("Not ready.")
         time.sleep(0.5)
 
     if not result.ready():
         print(
-            "FM-1: callback did not fire. pipeline is dead. "
-            "no aggregation, no final state, no visibility."
+            "FM-1: callback did not fire. Pipeline is dead. "
+            "No aggregation, no final state, no visibility."
         )
         return
 
     value = result.get(timeout=1, propagate=False)
     print(f"pipeline result: {value}")
 
-    assert not isinstance(value, ChordError), "Something failed: 'notify' not called."
+    # Without @enveloped the exception surfaces as ChordError. This assert
+    # documents the bug: the line below fails, proving FM-1 is un-fixed here.
+    assert not isinstance(value, ChordError), (
+        "ChordError reached the runner — notify was not called. "
+        "This is the FM-1 failure mode; fm1_mid_pipeline_error.py fixes it."
+    )
 
 
 if __name__ == "__main__":

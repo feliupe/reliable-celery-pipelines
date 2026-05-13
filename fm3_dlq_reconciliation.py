@@ -1,74 +1,33 @@
-"""Fix for FM-3: poison messages no longer loop forever; chords no
-longer stall when a header is dead-lettered.
+"""Fix for FM-3: poison messages no longer loop forever; chords no longer
+stall when a header is dead-lettered.
 
-Failure mode
-------------
-A poison message — one whose handler reliably crashes the worker —
-combined with FM-2's redelivery (acks_late + reject_on_worker_lost)
-loops forever. Every crash requeues; the next worker picks it up and
-crashes again. The chord never completes; workers are consumed.
+Delta from fm2_worker_crash.py
+-------------------------------
+- Quorum pipeline queue with x-dead-letter-exchange + x-delivery-limit:
+  after DELIVERY_LIMIT redeliveries the broker dead-letters the message
+  instead of requeuing. The crash loop is bounded at the broker level.
+- DLX exchange + DLQ queue declared at startup.
+- drain_dlq beat task: reads dead-lettered messages, writes a
+  SUCCESS-state Result(status="FAILURE") envelope via mark_as_done,
+  advancing Celery's native on_chord_part_return so the body fires.
+- POISON sentinel + its parse_document branch for doc4: crashes every
+  attempt until the broker DLQs it.
 
-Fix (two parts, both required)
-------------------------------
-1. Broker-level cap: quorum queue + x-delivery-limit
-   ------------------------------------------------
-   The pipeline queue is declared as a quorum queue with
-   x-delivery-limit set. After that many redeliveries the broker
-   dead-letters the message instead of requeuing. The crash loop is
-   bounded at the BROKER, not the worker — important, because a
-   worker-side counter would have to live somewhere durable across
-   the very crash it's trying to bound.
+FLAKE_SCHEDULE grows by one entry ("doc4": POISON). docs grows by one
+element ("doc4").
 
-   Quorum queues are required: classic queues don't track
-   x-delivery-count and have no equivalent ceiling.
-
-2. DLQ-driven chord finalization (Celery beat)
-   ------------------------------------------
-   Once the poison message is dead-lettered, the chord's coordinator
-   is still waiting for that header's result. A periodic beat task
-   `drain_dlq` reads each message in fm3.dead_letters, extracts the
-   chord context from its AMQP headers, and writes a SUCCESS result
-   with a Result(status="FAILURE") envelope through mark_as_done(...).
-
-   That triggers Celery's native on_chord_part_return: the chord's
-   group counter advances, and when it equals chord_size the body
-   is dispatched the same way it would be for any header completion.
-   No wall-clock threshold, no chord registry, no body bypass —
-   we use Celery's own coordinator instead of fighting it.
-
-Why mark_as_done (SUCCESS), not mark_as_failure
+Why mark_as_done (SUCCESS) not mark_as_failure
 -----------------------------------------------
-A chord member written with state=FAILURE causes
-_unpack_chord_result (celery/backends/redis.py) to raise ChordError
-when collecting the final results. That sends the failure to the
-body's link_error rather than firing the body. The chord effectively
-never completes from the body's perspective.
+A FAILURE-state chord member causes ChordError in the coordinator, sending
+the body to link_error instead of firing it. We write SUCCESS with a
+Result(status="FAILURE") payload — the same envelope shape @enveloped
+produces — so the coordinator advances normally. See shared/dlq.py.
 
-The fix mirrors what fm1_mid_pipeline_error.py does via @enveloped:
-never let a FAILURE Celery state reach the chord coordinator. Instead,
-write Celery state=SUCCESS with a Result(status="FAILURE") payload that
-ENCODES the failure. The coordinator sees clean SUCCESS states across
-all members and dispatches the body normally. notify.si(pipeline_id)
-ignores header results entirely (immutable signature), so the envelope
-shape doesn't matter here — only its Celery state being SUCCESS does.
-
-Hard dependencies on other fixes
---------------------------------
-FM-2 (acks_late + reject_on_worker_lost): without it the broker
-acks the message at receipt and there's no redelivery to count
-toward x-delivery-limit. No DLQ landing, no finalization.
-
-FM-4 (idempotency on notify): drain_dlq's mark_as_done is
-idempotent (overwrites the result key), but a manual requeue of a
-DLQ'd message from the management UI can produce a second
-on_chord_part_return for the same task_id. Redis backend cleans up
-chord state after dispatch so the second call no-ops, but FM-4
-remains the canonical defense against event-level double-fire.
-
-FM-6 (time_limit): tasks that hang without crashing don't redeliver
-and therefore never reach the DLQ. The hard time_limit is what
-converts a hang into a worker death → redelivery → DLQ → drain.
-Without FM-6, this file cannot recover from hangs.
+Hard dependencies on other FMs
+-------------------------------
+FM-2 (acks_late + reject_on_worker_lost): without it the broker acks the
+message at receipt and redelivery never happens — no x-delivery-count
+increment, no DLQ landing.
 
 Run
 ---
@@ -76,14 +35,8 @@ Run
   celery -A fm3_dlq_reconciliation worker --loglevel=info --concurrency=2 --beat
   python fm3_dlq_reconciliation.py
 
-`--beat` runs the scheduler in-worker, fine for the demo. In
-production beat is a separate process so the worker fleet can scale
-independently of schedule dispatch.
-
-If a previous run created the pipeline queue with different x-args
-(e.g. classic queue, no DLX), RabbitMQ refuses to redeclare with the
-new args. Reset with `docker-compose down -v` if startup fails on
-PRECONDITION_FAILED.
+If a previous run created the pipeline queue with different x-args, reset
+with `docker-compose down -v` to avoid PRECONDITION_FAILED on redeclare.
 """
 
 from __future__ import annotations
@@ -92,24 +45,27 @@ import os
 import signal
 import uuid
 
-import redis
 from celery import Celery, chord
 from celery.schedules import schedule
-from kombu import Exchange, Queue
-
 from shared.counters import incr_attempts, read_attempts, reset_attempts
 from shared.decorators import enveloped
+from shared.dlq import declare_dlq, drain_dlq_messages
+
+from shared.redis import REDIS_URL, client
+from shared.flake import (
+    CRASH_ONCE,
+    FAIL,
+    POISON,
+    FlakeEntry,
+)
+
 from shared.fm_asserts import (
     assert_fm1_chord_body_fired,
     assert_fm2_redelivery_happened,
     assert_fm3_poison_bounded_at_dlq,
 )
-from shared.inspect import print_all_task_results
 from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
-
-REDIS_URL = "redis://localhost:6379/0"
-ATTEMPTS_KEY_PREFIX = "fm3:crash_attempts"
 
 app = Celery(
     "fm3_dlq_reconciliation",
@@ -119,92 +75,28 @@ app = Celery(
 
 
 # ---------------------------------------------------------------------------
-# Broker topology: quorum pipeline queue + dead-letter exchange/queue
+# FM-3: broker topology — quorum queue + dead-letter exchange + DLQ
 # ---------------------------------------------------------------------------
 
-DLX_NAME = "fm3.dlx"
-DLQ_NAME = "fm3.dead_letters"
-PIPELINE_QUEUE = "fm3.pipeline"
-
-# Dead-letter target. Quorum so the DLQ itself survives broker
-# restarts — losing dead-lettered messages defeats the point.
-dlx_exchange = Exchange(DLX_NAME, type="direct", durable=True)
-dead_letter_queue = Queue(
-    DLQ_NAME,
-    exchange=dlx_exchange,
-    routing_key="dead",
-    durable=True,
-    queue_arguments={"x-queue-type": "quorum"},
-)
-
-# x-delivery-limit is a quorum-queue-only feature; classic queues
-# don't track delivery count and can't bound infinite redelivery at
-# the broker level. After the limit is hit, the broker dead-letters
-# instead of requeuing, breaking the FM-2-induced crash loop.
-DELIVERY_LIMIT = 3
-pipeline_exchange = Exchange("fm3.pipeline", type="direct", durable=True)
-pipeline_queue = Queue(
-    PIPELINE_QUEUE,
-    exchange=pipeline_exchange,
-    routing_key="pipeline",
-    durable=True,
-    queue_arguments={
-        "x-queue-type": "quorum",
-        "x-dead-letter-exchange": DLX_NAME,
-        "x-dead-letter-routing-key": "dead",
-        "x-delivery-limit": DELIVERY_LIMIT,
-    },
-)
-
-# Only the pipeline queue is a task queue (= the worker consumes from
-# it). The DLQ is declared on the broker (below) so the DLX has
-# somewhere to route dead-lettered messages, but Celery does NOT
-# consume from it — DLQ contents are pulled by drain_dlq via
-# basic.get, not by Celery's task consumer. If the DLQ were a task
-# queue, the worker would pick up the poison message from the DLQ
-# and re-enter the same crash loop x-delivery-limit was meant to
-# break (the DLQ has no x-delivery-limit of its own).
-app.conf.task_queues = (pipeline_queue,)
-app.conf.task_default_queue = PIPELINE_QUEUE
-app.conf.update(task_default_exchange="fm3.pipeline", task_default_routing_key="pipeline")
-
-
-def _declare_dlq_topology() -> None:
-    """Declare the DLX exchange and DLQ on the broker so the
-    pipeline queue's dead-lettering has a target. Idempotent — safe
-    to call from both worker and driver processes at import time."""
-    with app.connection_for_write() as conn:
-        with conn.channel() as ch:
-            dlx_exchange.declare(channel=ch)
-            dead_letter_queue.declare(channel=ch)
-
-
-_declare_dlq_topology()
-
-# Quorum queues don't support global (per-connection) QoS; only
-# per-channel. With this flag, Celery inspects task_queues, finds the
-# quorum queue, and sends basic.qos with apply_global=False so the
-# broker doesn't reject basic.consume with "NOT_IMPLEMENTED - queue
-# '...' does not support global qos". Defaults to True in Celery 5.5+
-# (added in 5.5; absent in 5.4 entirely — requires the upgrade).
-app.conf.worker_detect_quorum_queues = True
-
-# Future-default flips in Celery 6.0; setting them explicitly silences
-# the pending-deprecation warnings and locks behavior.
-app.conf.broker_connection_retry_on_startup = True
-app.conf.worker_cancel_long_running_tasks_on_connection_loss = True
+dead_letter_queue, DELIVERY_LIMIT = declare_dlq(app, "fm3")
 
 
 # ---------------------------------------------------------------------------
-# DLQ drain cadence
+# FM-3: DLQ drain cadence
 # ---------------------------------------------------------------------------
 
-redis_client = redis.Redis.from_url(REDIS_URL)
-
-# Demo value. Production: ~30s. Lower = faster recovery, higher
-# broker load. The drain itself is cheap (basic.get returns None
-# when empty), so a tight cadence is fine.
 DRAIN_INTERVAL_SECONDS = 5
+
+
+# ---------------------------------------------------------------------------
+# Per-doc behavior schedule
+# ---------------------------------------------------------------------------
+
+FLAKE_SCHEDULE: dict[str, FlakeEntry] = {
+    "doc1": FAIL,  # FM-0: raises RuntimeError → FAILURE envelope (FM-1 proven)
+    "doc3": CRASH_ONCE,  # FM-2: SIGKILL on attempt 1; broker redelivers; succeeds attempt 2
+    "doc4": POISON,  # FM-3: permanent SIGKILL → x-delivery-limit → DLQ → drain_dlq finalizes
+}
 
 
 # ---------------------------------------------------------------------------
@@ -221,16 +113,23 @@ def fetch_document(self, doc_id: str) -> FetchPayload:
 @app.task(name="parse_document", bind=True, acks_late=True, reject_on_worker_lost=True)
 @enveloped
 def parse_document(self, fetched: dict) -> ParsePayload:
-    """doc1 simulates a poison message: every execution SIGKILLs the
-    worker mid-task. With FM-2's flags each crash requeues; with
-    x-delivery-limit, redelivery is capped and the broker
-    dead-letters the message. drain_dlq then finalizes the chord."""
     fetch_result = Result.from_dict(fetched, FetchPayload)
-
     doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
-    attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
+    attempts = incr_attempts(doc_id)
+    flake = FLAKE_SCHEDULE.get(doc_id)
 
-    if doc_id == "doc1":
+    # FM-0+: @enveloped catches this RuntimeError → FAILURE envelope
+    if flake is FAIL:
+        raise RuntimeError(f"parser crashed on {doc_id}")
+
+    # FM-2+: SIGKILL on attempt 1; redelivered and succeeds on attempt 2
+    if flake is CRASH_ONCE and attempts == 1:
+        print(f"  worker pid={os.getpid()}: crashing on {doc_id} (attempt 1)")
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    # FM-3+: permanent SIGKILL; x-delivery-limit caps the loop; drain_dlq
+    # finalizes the chord member by writing a SUCCESS-state FAILURE envelope.
+    if flake is POISON:
         print(
             f"  worker pid={os.getpid()}: poison crash on {doc_id} "
             f"(attempt {attempts}/{DELIVERY_LIMIT})"
@@ -243,30 +142,30 @@ def parse_document(self, fetched: dict) -> ParsePayload:
 
 @app.task(name="notify", bind=True, acks_late=True, reject_on_worker_lost=True)
 @enveloped
-def notify(self, pipeline_id: str) -> NotifyPayload:
-    """The chord body. Takes a pipeline identifier, not the header
-    results — in a real system it queries a database for per-doc
-    state of this run and dispatches downstream actions.
-
-    Decoupling notify from chord-piped args means the chord can fire
-    it identically regardless of how each header reached its
-    terminal state: a normal worker completion, a worker-side
-    failure converted to @enveloped FAILURE envelope (FM-1), or a
-    DLQ-finalization Result(status="FAILURE") (this file). All three
-    paths write a SUCCESS Celery state via the result backend; the
-    chord's on_chord_part_return advances the same way.
-
-    ok=0, failed=0 — notify.si() ignores header results; the chord
-    header count is not inspected here. NotifyPayload fields are
-    populated consistently with all other FMs."""
-    print(f"notify: finalizing pipeline {pipeline_id}")
-    return NotifyPayload(final=True, pipeline_id=pipeline_id, ok=0, failed=0)
+def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
+    typed: list[Result[ParsePayload]] = [
+        Result.from_dict(r, ParsePayload) for r in results
+    ]
+    ok = [r for r in typed if r.status == "SUCCESS"]
+    failed = [r for r in typed if r.status == "FAILURE"]
+    print(f"notify: {len(ok)} ok, {len(failed)} failed")
+    for r in ok:
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  ok:     {doc_id}")
+    for r in failed:
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  failed: {doc_id}: {r.error}")
+    return NotifyPayload(
+        final=True,
+        pipeline_id=pipeline_id,
+        ok=len(ok),
+        failed=len(failed),
+    )
 
 
 @app.task(name="drain_dlq")
 def drain_dlq() -> None:
-    """Beat task — see shared/dlq.py and module docstring for the protocol."""
-    from shared.dlq import drain_dlq_messages
+    """FM-3: beat task — see shared/dlq.py and module docstring."""
 
     drain_dlq_messages(app, dead_letter_queue)
 
@@ -280,67 +179,52 @@ app.conf.beat_schedule = {
 
 
 # ---------------------------------------------------------------------------
-# Driver
+# Runner
 # ---------------------------------------------------------------------------
 
 
 def run_pipeline() -> None:
-    docs = ["doc1", "doc2"]
-    reset_attempts(redis_client, docs, ATTEMPTS_KEY_PREFIX)
-
-    # pipeline_id is the domain identifier — what notify uses to
-    # query its own state. Distinct from chord_id (a Celery internal
-    # task_id), though for the demo either would work as the lookup
-    # key.
+    docs = ["doc1", "doc2", "doc3", "doc4"]
     pipeline_id = str(uuid.uuid4())
+    client.flushall()
 
-    # .si() — immutable signature. Without it, the chord would prepend
-    # the header results list to notify's args. With .si(), notify is
-    # invoked as notify(pipeline_id) regardless of whether each
-    # header succeeded naturally or was finalized via DLQ drain.
     header = [fetch_document.s(d) | parse_document.s() for d in docs]
-    pipeline = chord(header, body=notify.si(pipeline_id))
+    pipeline = chord(header, body=notify.s(pipeline_id=pipeline_id))
     chord_result = pipeline.apply_async()
     print(f"chord submitted: id={chord_result.id} pipeline_id={pipeline_id}")
 
-    # Wait for the chord body. Celery's coordinator dispatches it as
-    # soon as all members reach a SUCCESS-state result — doc2 from
-    # the worker, doc1 from drain_dlq's envelope write.
-    # Budget: DELIVERY_LIMIT crashes (~5-15s) + drain interval (≤5s)
-    # + body run (~1s) << 90s.
+    # Budget: DELIVERY_LIMIT crashes (~5-15s) + drain interval (≤5s) + chord body. 30s comfortable.
     print("waiting for chord body...")
     wait_until(
         chord_result.ready,
-        timeout=90,
+        timeout=30,
         interval=1,
-        message="chord body did not fire within 90s",
+        message="chord body did not fire within 30s",
     )
 
     raw = chord_result.get(timeout=1)
     print(f"pipeline result: {raw}")
     notify_result = Result.from_dict(raw, NotifyPayload)
 
-    doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
-    doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
-    print("attempts (from Redis):")
-    print(
-        f"  doc1: {doc1_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)"
-    )
+    doc2_attempts = read_attempts("doc2")
+    doc3_attempts = read_attempts("doc3")
+    doc4_attempts = read_attempts("doc4")
+    print("parse_document entries (from Redis):")
+    print(f"  doc1: {read_attempts('doc1')} (expected 1)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
+    print(f"  doc3: {doc3_attempts} (expected 2 — crash + redelivery)")
+    print(
+        f"  doc4: {doc4_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)"
+    )
 
     assert assert_fm1_chord_body_fired(notify_result)
-    assert (
-        notify_result.payload.pipeline_id == pipeline_id
-    ), f"notify ran with wrong pipeline_id: {notify_result.payload.pipeline_id!r}"
-    assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
-    assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
-    assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"
+    assert_fm2_redelivery_happened(doc3_attempts, doc2_attempts)
+    assert_fm3_poison_bounded_at_dlq(doc4_attempts, delivery_limit=DELIVERY_LIMIT)
     print(
-        f"FM-3 fixed: poison capped at {doc1_attempts} crashes (DLQ); "
+        f"FM-3 fixed: poison capped at {doc4_attempts} crashes (DLQ); "
         f"drain_dlq finalized chord-member; body fired via native coordinator."
     )
 
 
 if __name__ == "__main__":
     run_pipeline()
-    print_all_task_results(redis_client)

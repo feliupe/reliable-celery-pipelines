@@ -1,33 +1,32 @@
 """Fix for FM-1: chord callback fires even if header tasks fail.
 
-Technique: use @enveloped on every header task. The decorator catches any
-escaping exception and returns a typed Result[T](status="FAILURE") envelope
-instead of raising — so the chord coordinator always sees a SUCCESS Celery
-state, regardless of whether the task succeeded or failed at the domain level.
+Delta from fm0_naive.py
+-----------------------
+- bind=True + @enveloped on every task: escaping exceptions become
+  Result(status="FAILURE") envelopes — the chord coordinator sees
+  Celery state SUCCESS on all members and dispatches notify.
 
-The chord body (notify) receives a uniform list of Result[ParsePayload] dicts
-and filters by result.status to separate successes from failures.
-
-This replaces the previous manual try/except approach with a decorator-based
-pattern that is consistent across all FMs and composes cleanly with the retry
-machinery added in FM-5.
 
 Run
 ---
   docker-compose up -d
   celery -A fm1_mid_pipeline_error worker --loglevel=info
-  python fm1_mid_pipeline_error.py                  # FAIL_PARSE=1 (default): notify runs, reports failures
-  FAIL_PARSE=0 python fm1_mid_pipeline_error.py     # happy path
+  python fm1_mid_pipeline_error.py
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 
 from celery import Celery, chord
 
-from shared.decorators import enveloped
+from shared.decorators import (
+    enveloped,
+)
+from shared.flake import (
+    FAIL,
+    FlakeEntry,
+)
 from shared.fm_asserts import assert_fm1_chord_body_fired
 from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
@@ -37,6 +36,19 @@ app = Celery(
     broker="amqp://guest:guest@localhost:5672//",
     backend="redis://localhost:6379/0",
 )
+
+# ---------------------------------------------------------------------------
+# Per-doc behavior schedule
+# ---------------------------------------------------------------------------
+
+FLAKE_SCHEDULE: dict[str, FlakeEntry] = {
+    "doc1": FAIL,  # FM-0: raises RuntimeError — @enveloped converts it to a FAILURE envelope
+}
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
 
 
 @app.task(name="fetch_document", bind=True)
@@ -48,22 +60,21 @@ def fetch_document(self, doc_id: str) -> FetchPayload:
 @app.task(name="parse_document", bind=True)
 @enveloped
 def parse_document(self, fetched: dict) -> ParsePayload:
-    """Intentionally crashes when FAIL_PARSE=1 (the default).
-
-    @enveloped catches the RuntimeError and returns a FAILURE envelope —
-    the chord body fires regardless, proving FM-1 is fixed.
-    """
     fetch_result = Result.from_dict(fetched, FetchPayload)
     doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
-    if os.environ.get("FAIL_PARSE", "1") == "1":
+    flake = FLAKE_SCHEDULE.get(doc_id)
+
+    # FM-0+: @enveloped catches this RuntimeError and returns a FAILURE envelope
+    # instead of letting it escape — the chord body fires regardless.
+    if flake is FAIL:
         raise RuntimeError(f"parser crashed on {doc_id}")
+
     return ParsePayload(doc_id=doc_id, parsed=True)
 
 
 @app.task(name="notify", bind=True)
 @enveloped
 def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
-    """Cast header results to typed objects at the boundary."""
     typed: list[Result[ParsePayload]] = [
         Result.from_dict(r, ParsePayload) for r in results
     ]
@@ -79,6 +90,11 @@ def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
         ok=len(ok),
         failed=len(failed),
     )
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
 
 
 def run_pipeline() -> None:

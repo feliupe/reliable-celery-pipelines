@@ -1,4 +1,4 @@
-"""Poll-until-ready helper for FM run_pipeline() drivers."""
+"""Poll-until-ready helper for FM run_pipeline() runners."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def wait_until(
     """Poll `predicate` until it returns truthy or `timeout` seconds elapse.
 
     Raises AssertionError(message) on timeout — used in run_pipeline()
-    drivers to fail loudly when the chord body, lock claim, or duplicate
+    runners to fail loudly when the chord body, lock claim, or duplicate
     notify doesn't land in time.
     """
     deadline = time.time() + timeout
