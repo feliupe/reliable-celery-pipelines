@@ -28,7 +28,7 @@ Fix (two parts, both required)
    is still waiting for that header's result. A periodic beat task
    `drain_dlq` reads each message in fm3.dead_letters, extracts the
    chord context from its AMQP headers, and writes a SUCCESS result
-   with a failure envelope through app.backend.mark_as_done(...).
+   with a Result(status="FAILURE") envelope through mark_as_done(...).
 
    That triggers Celery's native on_chord_part_return: the chord's
    group counter advances, and when it equals chord_size the body
@@ -44,14 +44,13 @@ when collecting the final results. That sends the failure to the
 body's link_error rather than firing the body. The chord effectively
 never completes from the body's perspective.
 
-The fix mirrors what fm1_mid_pipeline_error.py does inside the task
-body: never write FAILURE; always write SUCCESS with an envelope
-payload `{ok: False, error: ...}` that ENCODES the failure. The
-chord coordinator sees clean SUCCESS states across all members and
-dispatches the body normally. The body inspects each envelope's
-`ok` flag if it cares; in this file's case, notify.si(pipeline_id)
-ignores header results entirely (immutable signature), so the
-envelope shape doesn't matter — only its state being SUCCESS does.
+The fix mirrors what fm1_mid_pipeline_error.py does via @enveloped:
+never let a FAILURE Celery state reach the chord coordinator. Instead,
+write Celery state=SUCCESS with a Result(status="FAILURE") payload that
+ENCODES the failure. The coordinator sees clean SUCCESS states across
+all members and dispatches the body normally. notify.si(pipeline_id)
+ignores header results entirely (immutable signature), so the envelope
+shape doesn't matter here — only its Celery state being SUCCESS does.
 
 Hard dependencies on other fixes
 --------------------------------
@@ -98,11 +97,19 @@ from celery import Celery, chord
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
-from shared.fm_asserts import assert_fm1_chord_body_fired, assert_fm3_poison_bounded_at_dlq
+from shared.counters import incr_attempts, read_attempts, reset_attempts
+from shared.decorators import enveloped
+from shared.fm_asserts import (
+    assert_fm1_chord_body_fired,
+    assert_fm2_redelivery_happened,
+    assert_fm3_poison_bounded_at_dlq,
+)
 from shared.inspect import print_all_task_results
+from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
+ATTEMPTS_KEY_PREFIX = "fm3:crash_attempts"
 
 app = Celery(
     "fm3_dlq_reconciliation",
@@ -201,28 +208,27 @@ redis_client = redis.Redis.from_url(REDIS_URL)
 DRAIN_INTERVAL_SECONDS = 5
 
 
-def _attempts_key(doc_id: str) -> str:
-    return f"fm3:crash_attempts:{doc_id}"
-
-
 # ---------------------------------------------------------------------------
 # Tasks
 # ---------------------------------------------------------------------------
 
 
-@app.task(name="fetch_document", acks_late=True, reject_on_worker_lost=True)
-def fetch_document(doc_id: str) -> dict:
-    return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
+@app.task(name="fetch_document", bind=True, acks_late=True, reject_on_worker_lost=True)
+@enveloped
+def fetch_document(self, doc_id: str) -> FetchPayload:
+    return FetchPayload(doc_id=doc_id, bytes=len(doc_id) * 100)
 
 
-@app.task(name="parse_document", acks_late=True, reject_on_worker_lost=True)
-def parse_document(fetched: dict) -> dict:
+@app.task(name="parse_document", bind=True, acks_late=True, reject_on_worker_lost=True)
+@enveloped
+def parse_document(self, fetched: dict) -> ParsePayload:
     """doc1 simulates a poison message: every execution SIGKILLs the
     worker mid-task. With FM-2's flags each crash requeues; with
     x-delivery-limit, redelivery is capped and the broker
     dead-letters the message. drain_dlq then finalizes the chord."""
-    doc_id = fetched["doc_id"]
-    attempts = redis_client.incr(_attempts_key(doc_id))
+    fetch_result = Result.from_dict(fetched, FetchPayload)
+    doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
+    attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
 
     if doc_id == "doc1":
         print(
@@ -232,11 +238,12 @@ def parse_document(fetched: dict) -> dict:
         os.kill(os.getpid(), signal.SIGKILL)
 
     print(f"  worker pid={os.getpid()}: parsed {doc_id} (attempt {attempts})")
-    return {"doc_id": doc_id, "ok": True, "parsed": True, "attempts": attempts}
+    return ParsePayload(doc_id=doc_id, parsed=True, attempts=attempts)
 
 
-@app.task(name="notify", acks_late=True, reject_on_worker_lost=True)
-def notify(pipeline_id: str) -> dict:
+@app.task(name="notify", bind=True, acks_late=True, reject_on_worker_lost=True)
+@enveloped
+def notify(self, pipeline_id: str) -> NotifyPayload:
     """The chord body. Takes a pipeline identifier, not the header
     results — in a real system it queries a database for per-doc
     state of this run and dispatches downstream actions.
@@ -244,12 +251,16 @@ def notify(pipeline_id: str) -> dict:
     Decoupling notify from chord-piped args means the chord can fire
     it identically regardless of how each header reached its
     terminal state: a normal worker completion, a worker-side
-    failure converted to envelope (FM-1), or a DLQ-finalization
-    envelope (this file). All three paths write a SUCCESS-state
-    result via the result backend; the chord's on_chord_part_return
-    advances the same way."""
+    failure converted to @enveloped FAILURE envelope (FM-1), or a
+    DLQ-finalization Result(status="FAILURE") (this file). All three
+    paths write a SUCCESS Celery state via the result backend; the
+    chord's on_chord_part_return advances the same way.
+
+    ok=0, failed=0 — notify.si() ignores header results; the chord
+    header count is not inspected here. NotifyPayload fields are
+    populated consistently with all other FMs."""
     print(f"notify: finalizing pipeline {pipeline_id}")
-    return {"final": True, "pipeline_id": pipeline_id}
+    return NotifyPayload(final=True, pipeline_id=pipeline_id, ok=0, failed=0)
 
 
 @app.task(name="drain_dlq")
@@ -272,20 +283,9 @@ app.conf.beat_schedule = {
 # ---------------------------------------------------------------------------
 
 
-def _reset(doc_ids: list[str]) -> None:
-    keys = [_attempts_key(d) for d in doc_ids]
-    if keys:
-        redis_client.delete(*keys)
-
-
-def _read_attempts(doc_id: str) -> int:
-    raw = redis_client.get(_attempts_key(doc_id))
-    return int(raw) if raw else 0
-
-
 def run_pipeline() -> None:
     docs = ["doc1", "doc2"]
-    _reset(docs)
+    reset_attempts(redis_client, docs, ATTEMPTS_KEY_PREFIX)
 
     # pipeline_id is the domain identifier — what notify uses to
     # query its own state. Distinct from chord_id (a Celery internal
@@ -315,19 +315,21 @@ def run_pipeline() -> None:
         message="chord body did not fire within 90s",
     )
 
-    value = chord_result.get(timeout=1)
-    print(f"pipeline result: {value}")
+    raw = chord_result.get(timeout=1)
+    print(f"pipeline result: {raw}")
+    notify_result = Result.from_dict(raw, NotifyPayload)
 
-    doc1_attempts = _read_attempts("doc1")
-    doc2_attempts = _read_attempts("doc2")
+    doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
+    doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
     print("attempts (from Redis):")
     print(f"  doc1: {doc1_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
 
-    assert_fm1_chord_body_fired(value)
-    assert value["pipeline_id"] == pipeline_id, (
-        f"notify ran with wrong pipeline_id: {value['pipeline_id']!r}"
+    assert_fm1_chord_body_fired(notify_result)
+    assert notify_result.payload.pipeline_id == pipeline_id, (
+        f"notify ran with wrong pipeline_id: {notify_result.payload.pipeline_id!r}"
     )
+    assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
     assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"
     print(
