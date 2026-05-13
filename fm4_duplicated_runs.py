@@ -28,7 +28,7 @@ The lock value itself encodes the send state:
   SET key 0 NX EX <lock_ttl>          → claim acquired (we will send)
   SETNX failed → GET key:
         b"0"  another worker mid-send → self.retry(countdown=10s)
-        b"1"  already sent            → no-op success envelope
+        b"1"  already sent            → no-op, return NotifyPayload(sent=False)
   After send_email() →
         SET key 1                     → durable sent marker, no TTL
 
@@ -41,8 +41,8 @@ Chord-body signature: .s() not .si()
 fm3_dlq_reconciliation.py uses notify.si(pipeline_id) to ignore the
 header results list. Here we switch to notify.s(pipeline_id=...) so
 header results flow in as `results` — letting notify aggregate
-ok/failed across both doc2's normal envelope and doc1's
-DLQ-finalized envelope (both shapes carry an `ok` field).
+ok/failed across both doc2's normal Result[ParsePayload] and doc1's
+DLQ-finalized Result (both carry status="SUCCESS"|"FAILURE").
 
 Run
 ---
@@ -66,8 +66,11 @@ from celery import Celery, chord
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.counters import incr_attempts, read_attempts, reset_attempts
+from shared.decorators import enveloped
 from shared.fm_asserts import (
     assert_fm1_chord_body_fired,
+    assert_fm2_redelivery_happened,
     assert_fm3_poison_bounded_at_dlq,
     assert_fm4_notify_idempotent,
 )
@@ -78,9 +81,11 @@ from shared.idempotency import (
     reset_send_count,
     send_email,
 )
+from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
+ATTEMPTS_KEY_PREFIX = "fm4:crash_attempts"
 
 app = Celery(
     "fm4_duplicated_runs",
@@ -149,10 +154,6 @@ redis_client = redis.Redis.from_url(REDIS_URL)
 DRAIN_INTERVAL_SECONDS = 5
 
 
-def _attempts_key(doc_id: str) -> str:
-    return f"fm4:crash_attempts:{doc_id}"
-
-
 # ---------------------------------------------------------------------------
 # Idempotency machinery
 # ---------------------------------------------------------------------------
@@ -178,15 +179,18 @@ LOCK_CONTENTION_KEY = "fm4:notify:lock_contention_count"
 # ---------------------------------------------------------------------------
 
 
-@app.task(name="fetch_document", acks_late=True, reject_on_worker_lost=True)
-def fetch_document(doc_id: str) -> dict:
-    return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
+@app.task(name="fetch_document", bind=True, acks_late=True, reject_on_worker_lost=True)
+@enveloped
+def fetch_document(self, doc_id: str) -> FetchPayload:
+    return FetchPayload(doc_id=doc_id, bytes=len(doc_id) * 100)
 
 
-@app.task(name="parse_document", acks_late=True, reject_on_worker_lost=True)
-def parse_document(fetched: dict) -> dict:
-    doc_id = fetched["doc_id"]
-    attempts = redis_client.incr(_attempts_key(doc_id))
+@app.task(name="parse_document", bind=True, acks_late=True, reject_on_worker_lost=True)
+@enveloped
+def parse_document(self, fetched: dict) -> ParsePayload:
+    fetch_result = Result.from_dict(fetched, FetchPayload)
+    doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
+    attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
 
     if doc_id == "doc1":
         print(
@@ -196,7 +200,7 @@ def parse_document(fetched: dict) -> dict:
         os.kill(os.getpid(), signal.SIGKILL)
 
     print(f"  worker pid={os.getpid()}: parsed {doc_id} (attempt {attempts})")
-    return {"doc_id": doc_id, "ok": True, "parsed": True, "attempts": attempts}
+    return ParsePayload(doc_id=doc_id, parsed=True, attempts=attempts)
 
 
 @app.task(
@@ -206,13 +210,19 @@ def parse_document(fetched: dict) -> dict:
     acks_late=True,
     reject_on_worker_lost=True,
 )
-def notify(self, results: list[dict], pipeline_id: str) -> dict:
+@enveloped
+def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
     """Send the completion email at most once per pipeline_id.
 
     Three branches, keyed off the lock state:
       - SETNX wins → state=NOT_SENT, we send, then flip to SENT
       - state=NOT_SENT (lock held) → busy-retry in 10s
-      - state=SENT → fast skip, return summary with sent=False
+      - state=SENT → fast skip, return NotifyPayload(sent=False)
+
+    Not decorated with @enveloped wrapping the retry logic —
+    @enveloped sits outside and only fires on final success or
+    unhandled exception; self.retry() raises Retry which @enveloped
+    passes through to Celery's framework.
     """
     state_key = _notify_state_key(pipeline_id)
 
@@ -227,7 +237,15 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
         state = redis_client.get(state_key)
         if state == NOTIFY_STATE_SENT:
             print(f"  notify({pipeline_id}): already sent — skipping")
-            return _summary(results, pipeline_id, sent=False)
+            typed: list[Result[ParsePayload]] = [
+                Result.from_dict(r, ParsePayload) for r in results
+            ]
+            ok = [r for r in typed if r.status == "SUCCESS"]
+            failed = [r for r in typed if r.status == "FAILURE"]
+            return NotifyPayload(
+                final=True, pipeline_id=pipeline_id,
+                sent=False, ok=len(ok), failed=len(failed),
+            )
         # state == NOT_SENT: another worker is mid-send. By the time
         # we retry it'll be SENT (skip) or the TTL will have expired
         # (we claim).
@@ -238,11 +256,13 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
         )
         raise self.retry(countdown=NOTIFY_RETRY_DELAY_SECONDS)
 
-    # results carries a mix of envelope shapes: normal completions
-    # from parse_document and DLQ-finalized envelopes from drain_dlq.
-    # Both have an `ok` field, so this aggregation is uniform.
-    ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
-    failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
+    # Cast header results to typed objects at the boundary.
+    # Results carry a mix of envelope shapes: normal completions from
+    # parse_document and DLQ-finalized envelopes from drain_dlq.
+    # Both carry status="SUCCESS"|"FAILURE".
+    typed = [Result.from_dict(r, ParsePayload) for r in results]
+    ok = [r for r in typed if r.status == "SUCCESS"]
+    failed = [r for r in typed if r.status == "FAILURE"]
 
     # Not fully transactional: a worker crash between send_email()
     # and the SET below leaves state=0, so a redelivery will resend.
@@ -263,22 +283,15 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
 
     print(f"notify: {len(ok)} ok, {len(failed)} failed")
     for r in ok:
-        print(f"  ok:     {r.get('doc_id')}")
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  ok:     {doc_id}")
     for r in failed:
-        print(f"  failed: {r.get('doc_id')}: {r.get('error')}")
-    return _summary(results, pipeline_id, sent=True)
-
-
-def _summary(results: list[dict], pipeline_id: str, sent: bool) -> dict:
-    ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
-    failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
-    return {
-        "final": True,
-        "pipeline_id": pipeline_id,
-        "sent": sent,
-        "ok": len(ok),
-        "failed": len(failed),
-    }
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  failed: {doc_id}: {r.error}")
+    return NotifyPayload(
+        final=True, pipeline_id=pipeline_id,
+        sent=True, ok=len(ok), failed=len(failed),
+    )
 
 
 @app.task(name="drain_dlq")
@@ -300,23 +313,12 @@ app.conf.beat_schedule = {
 # ---------------------------------------------------------------------------
 
 
-def _reset(doc_ids: list[str]) -> None:
-    keys = [_attempts_key(d) for d in doc_ids]
-    if keys:
-        redis_client.delete(*keys)
-
-
-def _read_attempts(doc_id: str) -> int:
-    raw = redis_client.get(_attempts_key(doc_id))
-    return int(raw) if raw else 0
-
-
 def run_pipeline() -> None:
     docs = ["doc1", "doc2"]
     pipeline_id = str(uuid.uuid4())
     state_key = _notify_state_key(pipeline_id)
 
-    _reset(docs)
+    reset_attempts(redis_client, docs, ATTEMPTS_KEY_PREFIX)
     reset_send_count(redis_client, SEND_COUNT_KEY)
     reset_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     redis_client.delete(state_key)
@@ -357,8 +359,8 @@ def run_pipeline() -> None:
         message="tasks did not finish within 30s",
     )
 
-    first = chord_result.get(timeout=1)
-    second = duplicate_result.get(timeout=1)
+    first = Result.from_dict(chord_result.get(timeout=1), NotifyPayload)
+    second = Result.from_dict(duplicate_result.get(timeout=1), NotifyPayload)
     print(f"chord notify result:     {first}")
     print(f"duplicate notify result: {second}")
 
@@ -367,13 +369,14 @@ def run_pipeline() -> None:
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
 
-    doc1_attempts = _read_attempts("doc1")
-    doc2_attempts = _read_attempts("doc2")
+    doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
+    doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
     print("attempts (from Redis):")
     print(f"  doc1: {doc1_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
 
     assert_fm1_chord_body_fired(first)
+    assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
     assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"
     assert_fm4_notify_idempotent(first, second, pipeline_id, sends, contention)
