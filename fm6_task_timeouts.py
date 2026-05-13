@@ -9,7 +9,7 @@ The gap FM-6 closes
 -------------------
 FM-2's acks_late + reject_on_worker_lost recovers a crashed
 worker. FM-3 caps poison crashes via x-delivery-limit. FM-5
-catches transient blips via @retryable. But none of those handle
+catches transient blips via @transient_retryable. But none of those handle
 a task that simply hangs — stuck in a downstream socket read,
 waiting on a deadlocked lock, looping over an unbounded result
 set. The worker stays alive, the broker never sees a redelivery,
@@ -57,9 +57,10 @@ Manual hard timeout via @hard_timeout decorator
 -----------------------------------------------
 For chord members we enforce a per-task hard timeout from inside
 the task body via signal.setitimer(ITIMER_REAL) → SIGALRM. The
-decorator raises HardTimeoutExceeded, which @always_returns_envelope
-catches and converts to a SUCCESS-state envelope. No Celery
-on_timeout, no FAILURE chord-part write, no chord poisoning.
+decorator raises HardTimeoutExceeded, which @enveloped
+catches and converts to a SUCCESS-state Result(status="FAILURE")
+envelope. No Celery on_timeout, no FAILURE chord-part write, no
+chord poisoning.
 
 SIGALRM is safe to use: Celery's worker uses SIGUSR1 for soft
 timeout and parent-side SIGKILL for hard timeout; SIGALRM is
@@ -86,18 +87,17 @@ entirely.
 
 How this composes with prior FMs
 --------------------------------
-SoftTimeLimitExceeded propagates up through @retryable (not in
-retriable_exceptions — see below) and is caught by
-@always_returns_envelope, returning the same {ok: False, ...}
-shape as a retry-exhausted task.
+SoftTimeLimitExceeded propagates up through @transient_retryable
+(not in exceptions= — see below) and is caught by @enveloped,
+returning a Result(status="FAILURE") envelope.
 
 HardTimeoutExceeded (from @hard_timeout) takes the same envelope
 path as SoftTimeLimitExceeded. doc5 below demonstrates a task
 that ignores soft timeout — manual hard fires next, envelope
 returned.
 
-Why timeout exceptions are NOT in retriable_exceptions
-------------------------------------------------------
+Why timeout exceptions are NOT in transient_retryable's exceptions
+------------------------------------------------------------------
 A hang isn't a transient blip. If a downstream service is wedged,
 retrying the same call without backoff or remediation will hang
 again. Make the failure visible (envelope), let the operator
@@ -123,7 +123,6 @@ from __future__ import annotations
 
 import functools
 import os
-import random
 import signal
 import time
 import uuid
@@ -132,12 +131,15 @@ from typing import Any
 
 import redis
 from celery import Celery, chord
-from celery.exceptions import MaxRetriesExceededError, Retry, SoftTimeLimitExceeded
+from celery.exceptions import SoftTimeLimitExceeded
 from celery.schedules import schedule
 from kombu import Exchange, Queue
 
+from shared.counters import incr_attempts, read_attempts, reset_attempts
+from shared.decorators import enveloped, transient_retryable
 from shared.fm_asserts import (
     assert_fm1_chord_body_fired,
+    assert_fm2_redelivery_happened,
     assert_fm3_poison_bounded_at_dlq,
     assert_fm4_notify_idempotent,
     assert_fm5_doc_attempts,
@@ -151,9 +153,11 @@ from shared.idempotency import (
     reset_send_count,
     send_email,
 )
+from shared.result import FetchPayload, NotifyPayload, ParsePayload, Result
 from shared.wait import wait_until
 
 REDIS_URL = "redis://localhost:6379/0"
+ATTEMPTS_KEY_PREFIX = "fm6:attempts"
 
 app = Celery(
     "fm6_task_timeouts",
@@ -226,8 +230,8 @@ MAX_RETRIES = 3
 
 # Demo values. Production: align soft to your p99 + slack; manual
 # hard to ~2-3x soft (real ceiling); backstop far above both.
-SOFT_TIMEOUT_SECONDS = 2  # Celery soft → envelope via @always_returns_envelope
-MANUAL_HARD_TIMEOUT_SECONDS = 5  # @hard_timeout → envelope via @always_returns_envelope
+SOFT_TIMEOUT_SECONDS = 2  # Celery soft → envelope via @enveloped
+MANUAL_HARD_TIMEOUT_SECONDS = 5  # @hard_timeout → envelope via @enveloped
 BACKSTOP_HARD_TIMEOUT_SECONDS = 300  # Celery time_limit, never exercised in demo
 
 # notify includes a deliberate 3s send_email sleep + the busy-retry
@@ -239,70 +243,9 @@ NOTIFY_HARD_TIMEOUT_SECONDS = 300
 HANG_DURATION_SECONDS = 30
 
 
-def _attempts_key(doc_id: str) -> str:
-    return f"fm6:attempts:{doc_id}"
-
-
 # ---------------------------------------------------------------------------
-# Retry decorators (FM-5)
+# FM-6 lesson: @hard_timeout (stays inline — this IS the lesson)
 # ---------------------------------------------------------------------------
-
-
-class TransientServiceError(Exception):
-    """Stand-in for 503 / connection-reset / read-timeout from an external
-    service."""
-
-
-def always_returns_envelope(func: Callable[..., Any]) -> Callable[..., Any]:
-    @functools.wraps(func)
-    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(self, *args, **kwargs)
-        except Retry:
-            raise
-        except Exception as exc:
-            base = args[0] if args and isinstance(args[0], dict) else {}
-            return {
-                **base,
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "attempts": self.request.retries + 1,
-            }
-
-    return wrapper
-
-
-def retryable(
-    retriable_exceptions: tuple[type[BaseException], ...] = (),
-    max_retries: int = 3,
-    backoff_base: int = 2,
-    backoff_cap: int = 10,
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-        @functools.wraps(func)
-        def wrapper(self, *args: Any, **kwargs: Any) -> Any:
-            try:
-                return func(self, *args, **kwargs)
-            except retriable_exceptions as exc:
-                try:
-                    countdown = min(
-                        backoff_base**self.request.retries, backoff_cap
-                    ) + random.uniform(0, 1)
-                    print(
-                        f"  retry {self.name} (attempt "
-                        f"{self.request.retries + 1}): {exc}; "
-                        f"backoff {countdown:.2f}s"
-                    )
-                    raise self.retry(
-                        exc=exc, countdown=countdown, max_retries=max_retries
-                    )
-                except MaxRetriesExceededError:
-                    print(f"  {self.name} retries exhausted: {exc}")
-                    raise exc
-
-        return wrapper
-
-    return decorator
 
 
 class HardTimeoutExceeded(Exception):
@@ -318,17 +261,17 @@ def hard_timeout(
     FAILURE-state chord-part result via mark_as_failure before
     redelivery (celery/worker/request.py:521-538), poisoning the
     chord. By raising HardTimeoutExceeded from inside the task
-    body we keep the exception inside the existing envelope path:
-    @always_returns_envelope converts it to a SUCCESS-state
-    envelope, the chord coordinator advances normally.
+    body we keep the exception inside @enveloped's catch path:
+    it converts to a Result(status="FAILURE") envelope, the chord
+    coordinator advances normally.
 
     SIGALRM is safe to use here: Celery uses SIGUSR1 for soft
     timeout and parent-side SIGKILL for hard timeout; SIGALRM is
     untouched in the worker child. Linux/Unix only.
 
-    Innermost decorator — order: @app.task → @always_returns_envelope
-    → @retryable → @hard_timeout → body. The alarm covers only the
-    body, not decorator overhead.
+    Innermost decorator — order: @app.task → @enveloped
+    → @transient_retryable → @hard_timeout → body. The alarm covers
+    only the body, not decorator overhead.
     """
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -358,9 +301,7 @@ def hard_timeout(
 
 
 class _Sentinel:
-    """Identity-based marker for FLAKE_SCHEDULE entries. Using a small
-    class (rather than mixing strings and -1) lets every schedule value
-    be either a sentinel or an int count, with no ambiguous overlap."""
+    """Identity-based marker for FLAKE_SCHEDULE entries."""
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -371,7 +312,7 @@ class _Sentinel:
 
 POISON = _Sentinel("POISON")  # SIGKILL the worker (FM-3 path)
 FLAKE_FOREVER = _Sentinel("FLAKE_FOREVER")  # always raise TransientServiceError (FM-5 envelope path)
-SOFT_HANG = _Sentinel("SOFT_HANG")  # hang past soft limit, envelope via @always_returns_envelope
+SOFT_HANG = _Sentinel("SOFT_HANG")  # hang past soft limit, envelope via @enveloped
 HARD_HANG_MANUAL = _Sentinel("HARD_HANG_MANUAL")  # hang, ignore soft, manual @hard_timeout fires → envelope
 
 
@@ -382,6 +323,16 @@ FLAKE_SCHEDULE: dict[str, _Sentinel | int] = {
     "doc4": SOFT_HANG,
     "doc5": HARD_HANG_MANUAL,
 }
+
+
+# ---------------------------------------------------------------------------
+# Transient error type
+# ---------------------------------------------------------------------------
+
+
+class TransientServiceError(Exception):
+    """Stand-in for 503 / connection-reset / read-timeout from an external
+    service."""
 
 
 # ---------------------------------------------------------------------------
@@ -415,11 +366,11 @@ LOCK_CONTENTION_KEY = "fm6:notify:lock_contention_count"
     soft_time_limit=SOFT_TIMEOUT_SECONDS,
     time_limit=BACKSTOP_HARD_TIMEOUT_SECONDS,
 )
-@always_returns_envelope
-@retryable(retriable_exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
+@enveloped
+@transient_retryable(exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
 @hard_timeout(MANUAL_HARD_TIMEOUT_SECONDS)
-def fetch_document(self, doc_id: str) -> dict:
-    return {"doc_id": doc_id, "ok": True, "bytes": len(doc_id) * 100}
+def fetch_document(self, doc_id: str) -> FetchPayload:
+    return FetchPayload(doc_id=doc_id, bytes=len(doc_id) * 100)
 
 
 @app.task(
@@ -430,33 +381,34 @@ def fetch_document(self, doc_id: str) -> dict:
     soft_time_limit=SOFT_TIMEOUT_SECONDS,
     time_limit=BACKSTOP_HARD_TIMEOUT_SECONDS,
 )
-@always_returns_envelope
-@retryable(retriable_exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
+@enveloped
+@transient_retryable(exceptions=(TransientServiceError,), max_retries=MAX_RETRIES)
 @hard_timeout(MANUAL_HARD_TIMEOUT_SECONDS)
-def parse_document(self, fetched: dict) -> dict:
-    doc_id = fetched["doc_id"]
-    attempts = redis_client.incr(_attempts_key(doc_id))
-    schedule = FLAKE_SCHEDULE.get(doc_id, 0)
+def parse_document(self, fetched: dict) -> ParsePayload:
+    fetch_result = Result.from_dict(fetched, FetchPayload)
+    doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
+    attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
+    flake = FLAKE_SCHEDULE.get(doc_id, 0)
 
-    if schedule is POISON:
+    if flake is POISON:
         print(
             f"  worker pid={os.getpid()}: poison crash on {doc_id} "
             f"(attempt {attempts}/{DELIVERY_LIMIT})"
         )
         os.kill(os.getpid(), signal.SIGKILL)
 
-    if schedule is SOFT_HANG:
+    if flake is SOFT_HANG:
         # No try/except: SoftTimeLimitExceeded propagates up,
-        # @retryable passes it through (not in retriable_exceptions),
-        # @always_returns_envelope converts to {ok: False, ...}.
+        # @transient_retryable passes it through (not in exceptions=),
+        # @enveloped converts to Result(status="FAILURE").
         print(f"  worker pid={os.getpid()}: hanging on {doc_id} (soft-honoring)")
         time.sleep(HANG_DURATION_SECONDS)
 
-    if schedule is HARD_HANG_MANUAL:
+    if flake is HARD_HANG_MANUAL:
         # Hang, catch + ignore the soft signal, let the manual
         # @hard_timeout fire next. HardTimeoutExceeded propagates up
-        # through @retryable (not retriable) and is caught by
-        # @always_returns_envelope → SUCCESS-state envelope. No
+        # through @transient_retryable (not retriable) and is caught by
+        # @enveloped → Result(status="FAILURE") envelope. No
         # FAILURE chord-part write, no chord poisoning.
         try:
             print(
@@ -471,13 +423,11 @@ def parse_document(self, fetched: dict) -> dict:
             )
             time.sleep(HANG_DURATION_SECONDS)
 
-    if schedule is FLAKE_FOREVER or (
-        isinstance(schedule, int) and attempts <= schedule
-    ):
+    if flake is FLAKE_FOREVER or (isinstance(flake, int) and attempts <= flake):
         raise TransientServiceError(f"503 from parser-svc on {doc_id}")
 
     print(f"  worker pid={os.getpid()}: parsed {doc_id} (attempt {attempts})")
-    return {"doc_id": doc_id, "ok": True, "parsed": True, "attempts": attempts}
+    return ParsePayload(doc_id=doc_id, parsed=True, attempts=attempts)
 
 
 @app.task(
@@ -489,10 +439,11 @@ def parse_document(self, fetched: dict) -> dict:
     soft_time_limit=NOTIFY_SOFT_TIMEOUT_SECONDS,
     time_limit=NOTIFY_HARD_TIMEOUT_SECONDS,
 )
-def notify(self, results: list[dict], pipeline_id: str) -> dict:
-    """See fm4_duplicated_runs.py for the idempotency contract. Not
-    decorated — the chord-body return shape is {sent: True/False}
-    and @always_returns_envelope would clobber that on any failure."""
+@enveloped
+def notify(self, results: list[dict], pipeline_id: str) -> NotifyPayload:
+    """See fm4_duplicated_runs.py for the idempotency contract.
+    @enveloped sits outside; self.retry() raises Retry which @enveloped
+    passes through to Celery's framework."""
     state_key = _notify_state_key(pipeline_id)
 
     claimed = redis_client.set(
@@ -506,7 +457,15 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
         state = redis_client.get(state_key)
         if state == NOTIFY_STATE_SENT:
             print(f"  notify({pipeline_id}): already sent — skipping")
-            return _summary(results, pipeline_id, sent=False)
+            typed: list[Result[ParsePayload]] = [
+                Result.from_dict(r, ParsePayload) for r in results
+            ]
+            ok = [r for r in typed if r.status == "SUCCESS"]
+            failed = [r for r in typed if r.status == "FAILURE"]
+            return NotifyPayload(
+                final=True, pipeline_id=pipeline_id,
+                sent=False, ok=len(ok), failed=len(failed),
+            )
         redis_client.incr(LOCK_CONTENTION_KEY)
         print(
             f"  notify({pipeline_id}): lock held by another worker; "
@@ -514,11 +473,13 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
         )
         raise self.retry(countdown=NOTIFY_RETRY_DELAY_SECONDS)
 
-    # results carries four envelope shapes: normal completion,
+    # Cast header results to typed objects at the boundary.
+    # Results carry four envelope shapes: normal completion,
     # retryable-exhausted, soft-timeout, manual-hard-timeout, and
-    # DLQ-finalized poison. All carry an `ok` field.
-    ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
-    failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
+    # DLQ-finalized poison. All carry status="SUCCESS"|"FAILURE".
+    typed = [Result.from_dict(r, ParsePayload) for r in results]
+    ok = [r for r in typed if r.status == "SUCCESS"]
+    failed = [r for r in typed if r.status == "FAILURE"]
 
     send_email(
         f"Your pipeline documents are ready. "
@@ -532,22 +493,15 @@ def notify(self, results: list[dict], pipeline_id: str) -> dict:
 
     print(f"notify: {len(ok)} ok, {len(failed)} failed")
     for r in ok:
-        print(f"  ok:     {r.get('doc_id')}")
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  ok:     {doc_id}")
     for r in failed:
-        print(f"  failed: {r.get('doc_id')}: {r.get('error')}")
-    return _summary(results, pipeline_id, sent=True)
-
-
-def _summary(results: list[dict], pipeline_id: str, sent: bool) -> dict:
-    ok = [r for r in results if isinstance(r, dict) and r.get("ok")]
-    failed = [r for r in results if isinstance(r, dict) and not r.get("ok")]
-    return {
-        "final": True,
-        "pipeline_id": pipeline_id,
-        "sent": sent,
-        "ok": len(ok),
-        "failed": len(failed),
-    }
+        doc_id = r.payload.doc_id if r.payload else "?"
+        print(f"  failed: {doc_id}: {r.error}")
+    return NotifyPayload(
+        final=True, pipeline_id=pipeline_id,
+        sent=True, ok=len(ok), failed=len(failed),
+    )
 
 
 @app.task(name="drain_dlq")
@@ -569,35 +523,24 @@ app.conf.beat_schedule = {
 # ---------------------------------------------------------------------------
 
 
-def _reset(doc_ids: list[str]) -> None:
-    keys = [_attempts_key(d) for d in doc_ids]
-    if keys:
-        redis_client.delete(*keys)
-
-
-def _read_attempts(doc_id: str) -> int:
-    raw = redis_client.get(_attempts_key(doc_id))
-    return int(raw) if raw else 0
-
-
 def _expected_attempts(doc_id: str) -> int:
     """parse_document entries per doc.
 
     POISON                       → DELIVERY_LIMIT (broker cap)
     SOFT_HANG / HARD_HANG_MANUAL → 1 (no retry — timeout exceptions
-                                     not in retriable_exceptions)
+                                     not in transient_retryable's exceptions=)
     FLAKE_FOREVER                → 1 + MAX_RETRIES
     N (int ≥ 0)                  → N + 1
     """
-    schedule = FLAKE_SCHEDULE.get(doc_id, 0)
-    if schedule is POISON:
+    flake = FLAKE_SCHEDULE.get(doc_id, 0)
+    if flake is POISON:
         return DELIVERY_LIMIT
-    if schedule is SOFT_HANG or schedule is HARD_HANG_MANUAL:
+    if flake is SOFT_HANG or flake is HARD_HANG_MANUAL:
         return 1
-    if schedule is FLAKE_FOREVER:
+    if flake is FLAKE_FOREVER:
         return MAX_RETRIES + 1
-    assert isinstance(schedule, int)
-    return schedule + 1
+    assert isinstance(flake, int)
+    return flake + 1
 
 
 def run_pipeline() -> None:
@@ -605,7 +548,7 @@ def run_pipeline() -> None:
     pipeline_id = str(uuid.uuid4())
     state_key = _notify_state_key(pipeline_id)
 
-    _reset(docs)
+    reset_attempts(redis_client, docs, ATTEMPTS_KEY_PREFIX)
     reset_send_count(redis_client, SEND_COUNT_KEY)
     reset_lock_contention_count(redis_client, LOCK_CONTENTION_KEY)
     redis_client.delete(state_key)
@@ -637,8 +580,8 @@ def run_pipeline() -> None:
         message="tasks did not finish within 30s",
     )
 
-    first = chord_result.get(timeout=1)
-    second = duplicate_result.get(timeout=1)
+    first = Result.from_dict(chord_result.get(timeout=1), NotifyPayload)
+    second = Result.from_dict(duplicate_result.get(timeout=1), NotifyPayload)
     print(f"chord notify result:     {first}")
     print(f"duplicate notify result: {second}")
 
@@ -647,20 +590,24 @@ def run_pipeline() -> None:
     print(f"send_email invocations:    {sends}")
     print(f"lock contention retries:   {contention}")
 
-    doc1_attempts = _read_attempts("doc1")
+    doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
+    doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
     print("parse_document entries (from Redis):")
     for d in docs:
-        actual = _read_attempts(d)
+        actual = read_attempts(redis_client, d, ATTEMPTS_KEY_PREFIX)
         expected = _expected_attempts(d)
         print(f"  {d}: {actual} (expected {expected}, schedule={FLAKE_SCHEDULE[d]})")
 
     assert_fm1_chord_body_fired(first)
+    assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
     assert_fm4_notify_idempotent(first, second, pipeline_id, sends, contention)
     assert_fm5_retryable_result(first, expected_ok=1, expected_failed=4)
     for d in docs:
         assert_fm5_doc_attempts(
-            d, _read_attempts(d), _expected_attempts(d),
+            d,
+            read_attempts(redis_client, d, ATTEMPTS_KEY_PREFIX),
+            _expected_attempts(d),
             is_poison=(FLAKE_SCHEDULE[d] is POISON),
         )
     assert_fm6_hang_envelopes(first, expected_ok=1, expected_failed=4)
