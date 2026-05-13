@@ -168,7 +168,7 @@ def run_pipeline() -> None:
     print(f"  doc1: {doc1_attempts} (expected 2 — crash + redelivery)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
 
-    assert_fm1_chord_body_fired(notify_result)
+    assert assert_fm1_chord_body_fired(notify_result)
     assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     assert doc1_attempts == 2, (
         f"FM-2: doc1 should have run exactly twice; got {doc1_attempts}"

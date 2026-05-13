@@ -129,8 +129,7 @@ pipeline_queue = Queue(
 
 app.conf.task_queues = (pipeline_queue,)
 app.conf.task_default_queue = PIPELINE_QUEUE
-app.conf.task_default_exchange = "fm5.pipeline"
-app.conf.task_default_routing_key = "pipeline"
+app.conf.update(task_default_exchange="fm5.pipeline", task_default_routing_key="pipeline")
 
 
 def _declare_dlq_topology() -> None:
@@ -411,7 +410,7 @@ def run_pipeline() -> None:
         expected = _expected_attempts(d)
         print(f"  {d}: {actual} (expected {expected}, schedule={FLAKE_SCHEDULE[d]})")
 
-    assert_fm1_chord_body_fired(first)
+    assert assert_fm1_chord_body_fired(first)
     assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
     assert_fm4_notify_idempotent(first, second, pipeline_id, sends, contention)

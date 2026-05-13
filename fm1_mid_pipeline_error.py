@@ -99,7 +99,7 @@ def run_pipeline() -> None:
 
     notify_result = Result.from_dict(raw, NotifyPayload)
 
-    assert_fm1_chord_body_fired(notify_result)
+    assert assert_fm1_chord_body_fired(notify_result)
     print("FM-1 fixed: notify ran despite header task failures.")
 
 

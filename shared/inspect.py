@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import redis
 
@@ -14,7 +15,7 @@ def print_all_task_results(redis_client: redis.Redis) -> None:
     """
     states: dict[str, int] = {}
     for key in redis_client.scan_iter(match="celery-task-meta-*"):
-        raw = redis_client.get(key)
+        raw = cast(bytes | None, redis_client.get(key))
         if not raw:
             continue
         meta = json.loads(raw)

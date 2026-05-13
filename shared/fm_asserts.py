@@ -15,23 +15,35 @@ calling).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from typing_extensions import TypeIs
 
 from shared.result import NotifyPayload, Result
+
+if TYPE_CHECKING:
+    from shared.result import SuccessResult
 
 
 # ---------------------------------------------------------------------------
 # FM-1
 # ---------------------------------------------------------------------------
 
-def assert_fm1_chord_body_fired(result: Result[NotifyPayload]) -> None:
-    """FM-1: chord body fired and notify ran despite header task failures."""
+def assert_fm1_chord_body_fired(result: Result[NotifyPayload]) -> "TypeIs[SuccessResult[NotifyPayload]]":
+    """FM-1: chord body fired and notify ran despite header task failures.
+
+    Returns a TypeGuard so callers can narrow result.payload to NotifyPayload:
+
+        assert assert_fm1_chord_body_fired(notify_result)
+        notify_result.payload.pipeline_id  # NotifyPayload, not None
+    """
     assert result.status == "SUCCESS", (
         f"FM-1 regression: chord body never fired — status={result.status!r}, "
         f"error={result.error!r}"
     )
     assert result.payload is not None, "FM-1 regression: notify payload is None"
     assert result.payload.final is True, "FM-1 regression: notify payload.final is not True"
+    return True
 
 
 # ---------------------------------------------------------------------------

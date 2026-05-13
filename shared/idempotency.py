@@ -10,6 +10,7 @@ independent runs.
 from __future__ import annotations
 
 import time
+from typing import cast
 
 import redis
 
@@ -34,7 +35,7 @@ def reset_send_count(redis_client: redis.Redis, send_count_key: str) -> None:
 
 
 def read_send_count(redis_client: redis.Redis, send_count_key: str) -> int:
-    raw = redis_client.get(send_count_key)
+    raw = cast(bytes | None, redis_client.get(send_count_key))
     return int(raw) if raw else 0
 
 
@@ -47,5 +48,5 @@ def reset_lock_contention_count(
 def read_lock_contention_count(
     redis_client: redis.Redis, lock_contention_key: str
 ) -> int:
-    raw = redis_client.get(lock_contention_key)
+    raw = cast(bytes | None, redis_client.get(lock_contention_key))
     return int(raw) if raw else 0

@@ -7,6 +7,8 @@ constant (e.g. "fm3:crash_attempts") so runs don't bleed into each other.
 
 from __future__ import annotations
 
+from typing import cast
+
 import redis
 
 
@@ -16,7 +18,7 @@ def incr_attempts(
     key_prefix: str,
 ) -> int:
     """Increment and return the attempt counter for doc_id."""
-    return int(redis_client.incr(f"{key_prefix}:{doc_id}"))
+    return int(cast(int, redis_client.incr(f"{key_prefix}:{doc_id}")))
 
 
 def read_attempts(
@@ -25,7 +27,7 @@ def read_attempts(
     key_prefix: str,
 ) -> int:
     """Return current attempt count for doc_id (0 if not set)."""
-    raw = redis_client.get(f"{key_prefix}:{doc_id}")
+    raw = cast(bytes | None, redis_client.get(f"{key_prefix}:{doc_id}"))
     return int(raw) if raw else 0
 
 

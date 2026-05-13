@@ -74,8 +74,8 @@ def _finalize_dlq_message(app: Celery, msg: Any) -> None:
     context.id = task_id
     context.group = group_id
     context.group_index = group_index
-    context.chord = app.signature(chord_sig)
-    context.task = task_name
+    context.chord = app.signature(chord_sig)  # type: ignore[assignment]
+    context.task = task_name  # type: ignore[attr-defined]
 
     doc_id = _infer_doc_id_from_args(args)
     context = FetchPayload(doc_id=doc_id, bytes=0) if doc_id else None

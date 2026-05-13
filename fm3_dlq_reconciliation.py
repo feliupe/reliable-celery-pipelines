@@ -166,8 +166,7 @@ pipeline_queue = Queue(
 # break (the DLQ has no x-delivery-limit of its own).
 app.conf.task_queues = (pipeline_queue,)
 app.conf.task_default_queue = PIPELINE_QUEUE
-app.conf.task_default_exchange = "fm3.pipeline"
-app.conf.task_default_routing_key = "pipeline"
+app.conf.update(task_default_exchange="fm3.pipeline", task_default_routing_key="pipeline")
 
 
 def _declare_dlq_topology() -> None:
@@ -227,6 +226,7 @@ def parse_document(self, fetched: dict) -> ParsePayload:
     x-delivery-limit, redelivery is capped and the broker
     dead-letters the message. drain_dlq then finalizes the chord."""
     fetch_result = Result.from_dict(fetched, FetchPayload)
+
     doc_id = fetch_result.payload.doc_id if fetch_result.payload else "unknown"
     attempts = incr_attempts(redis_client, doc_id, ATTEMPTS_KEY_PREFIX)
 
@@ -267,6 +267,7 @@ def notify(self, pipeline_id: str) -> NotifyPayload:
 def drain_dlq() -> None:
     """Beat task — see shared/dlq.py and module docstring for the protocol."""
     from shared.dlq import drain_dlq_messages
+
     drain_dlq_messages(app, dead_letter_queue)
 
 
@@ -322,13 +323,15 @@ def run_pipeline() -> None:
     doc1_attempts = read_attempts(redis_client, "doc1", ATTEMPTS_KEY_PREFIX)
     doc2_attempts = read_attempts(redis_client, "doc2", ATTEMPTS_KEY_PREFIX)
     print("attempts (from Redis):")
-    print(f"  doc1: {doc1_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)")
+    print(
+        f"  doc1: {doc1_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)"
+    )
     print(f"  doc2: {doc2_attempts} (expected 1)")
 
-    assert_fm1_chord_body_fired(notify_result)
-    assert notify_result.payload.pipeline_id == pipeline_id, (
-        f"notify ran with wrong pipeline_id: {notify_result.payload.pipeline_id!r}"
-    )
+    assert assert_fm1_chord_body_fired(notify_result)
+    assert (
+        notify_result.payload.pipeline_id == pipeline_id
+    ), f"notify ran with wrong pipeline_id: {notify_result.payload.pipeline_id!r}"
     assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
     assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"

@@ -131,8 +131,7 @@ pipeline_queue = Queue(
 
 app.conf.task_queues = (pipeline_queue,)
 app.conf.task_default_queue = PIPELINE_QUEUE
-app.conf.task_default_exchange = "fm4.pipeline"
-app.conf.task_default_routing_key = "pipeline"
+app.conf.update(task_default_exchange="fm4.pipeline", task_default_routing_key="pipeline")
 
 
 def _declare_dlq_topology() -> None:
@@ -375,7 +374,7 @@ def run_pipeline() -> None:
     print(f"  doc1: {doc1_attempts} (expected ~{DELIVERY_LIMIT}, bounded by x-delivery-limit)")
     print(f"  doc2: {doc2_attempts} (expected 1)")
 
-    assert_fm1_chord_body_fired(first)
+    assert assert_fm1_chord_body_fired(first)
     assert_fm2_redelivery_happened(doc1_attempts, doc2_attempts)
     assert_fm3_poison_bounded_at_dlq(doc1_attempts, delivery_limit=DELIVERY_LIMIT)
     assert doc2_attempts == 1, f"doc2 should have run once; got {doc2_attempts}"

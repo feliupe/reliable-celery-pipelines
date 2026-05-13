@@ -10,13 +10,12 @@ a plain dict. Type hints on notify signatures and run_pipeline locals are
 for static analysis; runtime values are always dicts until reconstructed.
 """
 
-from __future__ import annotations
-
 import dataclasses
 from dataclasses import dataclass, asdict
-from typing import Any, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 T = TypeVar("T")
+_U = TypeVar("_U")  # free TypeVar for from_dict — T is bound to the class's Generic[T]
 
 
 @dataclass
@@ -41,7 +40,7 @@ class Result(Generic[T]):
     # ------------------------------------------------------------------
 
     @classmethod
-    def success(cls, payload: T, *, attempts: int) -> Result[T]:
+    def success(cls, payload: T, *, attempts: int) -> "Result[T]":
         return cls(status="SUCCESS", payload=payload, error=None, attempts=attempts)
 
     @classmethod
@@ -51,7 +50,7 @@ class Result(Generic[T]):
         *,
         attempts: int | None,
         context: T | None = None,
-    ) -> Result[T]:
+    ) -> "Result[T]":
         return cls(status="FAILURE", payload=context, error=error, attempts=attempts)
 
     # ------------------------------------------------------------------
@@ -71,8 +70,8 @@ class Result(Generic[T]):
             "attempts": self.attempts,
         }
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any], payload_cls: type[T]) -> Result[T]:
+    @staticmethod
+    def from_dict(d: dict[str, Any], payload_cls: type[_U]) -> "Result[_U]":
         """Reconstruct a typed Result from a Celery result dict.
 
         Usage in notify / run_pipeline:
@@ -81,17 +80,28 @@ class Result(Generic[T]):
         raw_payload = d.get("payload")
         if raw_payload is not None and isinstance(raw_payload, dict):
             try:
-                payload: T | None = payload_cls(**raw_payload)
+                payload: _U | None = payload_cls(**raw_payload)
             except (TypeError, KeyError):
                 payload = None
         else:
             payload = None
-        return cls(
-            status=d["status"],
+        raw_status = d["status"]
+        if raw_status not in ("SUCCESS", "FAILURE"):
+            raise ValueError(f"unexpected status: {raw_status!r}")
+        status: Literal["SUCCESS", "FAILURE"] = raw_status
+        return Result(
+            status=status,
             payload=payload,
             error=d.get("error"),
             attempts=d.get("attempts"),
         )
+
+
+if TYPE_CHECKING:
+    @dataclass
+    class SuccessResult(Result[T]):  # type: ignore[misc]
+        """Result[T] narrowed to SUCCESS: payload is guaranteed non-None."""
+        payload: T  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
