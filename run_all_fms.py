@@ -141,16 +141,17 @@ def ensure_services_up() -> None:
             check=True,
         )
 
-    deadline = time.time() + 60
+    deadline = time.time() + 180
     while time.time() < deadline:
         if _port_open("localhost", 6379) and _port_open(RABBITMQ_HOST, RABBITMQ_PORT):
             break
         time.sleep(1)
     else:
-        raise RuntimeError("redis/rabbitmq did not become reachable within 60s")
+        raise RuntimeError("redis/rabbitmq did not become reachable within 180s")
 
     # RabbitMQ accepts TCP before it's ready to declare queues; poll rabbitmqctl.
-    deadline = time.time() + 60
+    # CI runners on cold image pulls regularly need >60s here.
+    deadline = time.time() + 180
     while time.time() < deadline:
         rc = subprocess.run(
             ["docker", "exec", RABBITMQ_CONTAINER, "rabbitmqctl", "await_startup"],
@@ -160,7 +161,7 @@ def ensure_services_up() -> None:
             print("[setup] rabbitmq ready")
             return
         time.sleep(1)
-    raise RuntimeError("rabbitmq did not finish startup within 60s")
+    raise RuntimeError("rabbitmq did not finish startup within 180s")
 
 
 # ---------------------------------------------------------------------------
