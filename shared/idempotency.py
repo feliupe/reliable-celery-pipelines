@@ -11,7 +11,7 @@ from shared.redis import client
 
 # Real email APIs take 1–3s on a healthy day. We model that so the
 # idempotency lock is genuinely held when the duplicate notify arrives.
-SEND_EMAIL_DURATION_SECONDS = 3
+SEND_EMAIL_DURATION_SECONDS = 2
 
 NOTIFY_LOCK_TTL_SECONDS = 600
 NOTIFY_STATE_NOT_SENT = "not_sent"

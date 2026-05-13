@@ -116,7 +116,7 @@ app = Celery(
 
 dead_letter_queue, DELIVERY_LIMIT = declare_dlq(app, "fm6")
 
-DRAIN_INTERVAL_SECONDS = 5
+DRAIN_INTERVAL_SECONDS = 2
 MAX_RETRIES = 3
 
 
@@ -145,7 +145,7 @@ HANG_DURATION_SECONDS = 30
 # FM-4: idempotency machinery
 # ---------------------------------------------------------------------------
 
-NOTIFY_RETRY_DELAY_SECONDS = 10
+NOTIFY_RETRY_DELAY_SECONDS = 2
 
 # ---------------------------------------------------------------------------
 # FM-5: transient error type

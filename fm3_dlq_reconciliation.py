@@ -85,7 +85,7 @@ dead_letter_queue, DELIVERY_LIMIT = declare_dlq(app, "fm3")
 # FM-3: DLQ drain cadence
 # ---------------------------------------------------------------------------
 
-DRAIN_INTERVAL_SECONDS = 5
+DRAIN_INTERVAL_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------

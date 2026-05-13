@@ -78,7 +78,7 @@ FM_SPECS: list[FMSpec] = [
         concurrency=2,
         queues=(),
         exchanges=(),
-        runner_timeout_seconds=60,
+        runner_timeout_seconds=30,
     ),
     FMSpec(
         "fm3_dlq_reconciliation",
@@ -86,7 +86,7 @@ FM_SPECS: list[FMSpec] = [
         concurrency=2,
         queues=("fm3.pipeline", "fm3.dead_letters"),
         exchanges=("fm3.pipeline", "fm3.dlx"),
-        runner_timeout_seconds=150,
+        runner_timeout_seconds=60,
     ),
     FMSpec(
         "fm4_duplicated_runs",
@@ -94,7 +94,7 @@ FM_SPECS: list[FMSpec] = [
         concurrency=2,
         queues=("fm4.pipeline", "fm4.dead_letters"),
         exchanges=("fm4.pipeline", "fm4.dlx"),
-        runner_timeout_seconds=120,
+        runner_timeout_seconds=60,
     ),
     FMSpec(
         "fm5_transient_failures",
@@ -102,7 +102,7 @@ FM_SPECS: list[FMSpec] = [
         concurrency=2,
         queues=("fm5.pipeline", "fm5.dead_letters"),
         exchanges=("fm5.pipeline", "fm5.dlx"),
-        runner_timeout_seconds=180,
+        runner_timeout_seconds=90,
     ),
     FMSpec(
         "fm6_task_timeouts",
@@ -110,7 +110,7 @@ FM_SPECS: list[FMSpec] = [
         concurrency=2,
         queues=("fm6.pipeline", "fm6.dead_letters"),
         exchanges=("fm6.pipeline", "fm6.dlx"),
-        runner_timeout_seconds=240,
+        runner_timeout_seconds=90,
     ),
 ]
 

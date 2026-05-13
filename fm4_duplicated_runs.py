@@ -74,14 +74,14 @@ app = Celery(
 
 dead_letter_queue, DELIVERY_LIMIT = declare_dlq(app, "fm4")
 
-DRAIN_INTERVAL_SECONDS = 5
+DRAIN_INTERVAL_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
 # FM-4: idempotency machinery
 # ---------------------------------------------------------------------------
 
-NOTIFY_RETRY_DELAY_SECONDS = 10
+NOTIFY_RETRY_DELAY_SECONDS = 2
 
 # ---------------------------------------------------------------------------
 # Per-doc behavior schedule

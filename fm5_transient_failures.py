@@ -79,7 +79,7 @@ app = Celery(
 
 dead_letter_queue, DELIVERY_LIMIT = declare_dlq(app, "fm5")
 
-DRAIN_INTERVAL_SECONDS = 5  # FM-3: DLQ drain cadence
+DRAIN_INTERVAL_SECONDS = 2  # FM-3: DLQ drain cadence
 MAX_RETRIES = 3  # FM-5: @transient_retryable retry budget
 
 
@@ -87,7 +87,7 @@ MAX_RETRIES = 3  # FM-5: @transient_retryable retry budget
 # FM-4: idempotency machinery
 # ---------------------------------------------------------------------------
 
-NOTIFY_RETRY_DELAY_SECONDS = 10
+NOTIFY_RETRY_DELAY_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
