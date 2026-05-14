@@ -1,5 +1,7 @@
 # reliable-celery-pipelines
 
+[![e2e](https://github.com/feliupe/reliable-celery-pipelines/actions/workflows/e2e.yml/badge.svg)](https://github.com/feliupe/reliable-celery-pipelines/actions/workflows/e2e.yml)
+
 A reference for building **fault-tolerant document-processing pipelines on Celery**, organized as a sequence of failure modes and the minimum-footprint patterns that neutralize each.
 
 ## The thesis
