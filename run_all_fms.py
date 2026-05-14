@@ -152,15 +152,30 @@ def ensure_services_up() -> None:
     # RabbitMQ accepts TCP before it's ready to declare queues; poll rabbitmqctl.
     # CI runners on cold image pulls regularly need >60s here.
     deadline = time.time() + 180
+    last_stderr = b""
     while time.time() < deadline:
-        rc = subprocess.run(
+        proc = subprocess.run(
             ["docker", "exec", RABBITMQ_CONTAINER, "rabbitmqctl", "await_startup"],
             capture_output=True,
-        ).returncode
-        if rc == 0:
-            print("[setup] rabbitmq ready")
+        )
+        if proc.returncode == 0:
+            print("[setup] rabbitmq ready", flush=True)
             return
-        time.sleep(1)
+        last_stderr = proc.stderr
+        time.sleep(2)
+    # Surface what's actually wrong.
+    print("[setup] rabbitmqctl last stderr:", flush=True)
+    print(last_stderr.decode(errors="replace"), flush=True)
+    print("[setup] docker logs reliable-celery-rabbitmq (tail):", flush=True)
+    subprocess.run(
+        ["docker", "logs", "--tail", "200", RABBITMQ_CONTAINER],
+        check=False,
+    )
+    print("[setup] docker inspect (state):", flush=True)
+    subprocess.run(
+        ["docker", "inspect", "--format", "{{json .State}}", RABBITMQ_CONTAINER],
+        check=False,
+    )
     raise RuntimeError("rabbitmq did not finish startup within 180s")
 
 

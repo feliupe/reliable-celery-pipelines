@@ -1,15 +1,19 @@
 services:
   rabbitmq:
-    image: rabbitmq:3-management
+    image: rabbitmq:3.13-management
     container_name: reliable-celery-rabbitmq
+    hostname: rabbitmq
+    # Start as uid 999 (the rabbitmq user) directly. The image's default
+    # entrypoint runs as root and drops privileges, which races the cookie
+    # file's chown on some CI runners and produces eacces. See
+    # https://community.okteto.com/t/error-rabbitmq-container-using-docker-compose-error-when-reading-var-lib-rabbitmq-erlang-cookie-eacces/761
+    user: "999:999"
     ports:
       - "5672:5672"
       - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
 
   # Celery result backend for all examples. RabbitMQ is the broker;
   # Redis holds task results and any cross-process shared state (e.g.
@@ -19,6 +23,3 @@ services:
     container_name: reliable-celery-redis
     ports:
       - "6379:6379"
-
-volumes:
-  rabbitmq_data:
